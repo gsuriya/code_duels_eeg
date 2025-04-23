@@ -9,13 +9,14 @@ import { Loader2, Users, Crown, Shield, BookOpen, Play, Check, X, ArrowRight } f
 import { useToast } from '@shared/hooks/ui/use-toast';
 import { supabase } from '@shared/config/supabase';
 import { Problem, Difficulty, TestCase } from '@/problems/problemTypes';
-import { getRandomEasyProblem } from '@/problems/problemService';
+import { getRandomEasyProblem, submitSolution, getProblemById } from '@/problems/problemService';
 import CodeEditor from '@shared/components/CodeEditor';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@ui/form/select';
 import { RealtimeChannel } from '@supabase/supabase-js';
 import { debounce } from 'lodash';
 import { Progress } from '@ui/data/progress';
 import Terminal from '@shared/components/Terminal';
+import inspect from 'util';
 
 // Types for battle state
 interface BattleState {
@@ -48,6 +49,12 @@ export default function Battle() {
   const [myCode, setMyCode] = useState<string>('');
   const [battleChannel, setBattleChannel] = useState<RealtimeChannel | null>(null);
   
+  // Game result states
+  const [hasWon, setHasWon] = useState<boolean>(false);
+  const [hasLost, setHasLost] = useState<boolean>(false);
+  const [gameOver, setGameOver] = useState<boolean>(false);
+  const [winnerName, setWinnerName] = useState<string>('');
+  
   // Premium status
   const [isPremium] = useState(() => {
     const userProfile = localStorage.getItem('userProfile');
@@ -78,9 +85,10 @@ export default function Battle() {
   const [terminalOutput, setTerminalOutput] = useState<Array<{
     content: string;
     type?: 'error' | 'success' | 'info' | 'default';
-  }>>([{
-    content: 'Code execution output will appear here...'
-  }]);
+  }>>([]);
+  
+  // Add state for active terminal tab
+  const [activeTerminalTab, setActiveTerminalTab] = useState<'output' | 'testcases'>('output');
 
   // Debounced function to broadcast code updates
   const broadcastCodeUpdate = useCallback(debounce((channel: RealtimeChannel | null, code: string) => {
@@ -110,21 +118,6 @@ export default function Battle() {
       return;
     }
 
-    // Set up channel instance
-    const channel = supabase.channel(`battle_${lobbyCode}`, {
-      config: {
-        broadcast: { self: false },
-        presence: { key: user?.uid || 'guest' }
-      }
-    });
-
-    // Set up channel handlers before subscribing
-    channel
-      .on('presence', { event: 'sync' }, () => {
-        console.log('Battle presence synced');
-      });
-
-    // Single subscription
     const setupBattle = async () => {
       try {
         setIsLoading(true);
@@ -139,35 +132,168 @@ export default function Battle() {
 
         if (lobbyError) throw lobbyError;
 
-        // --- Select a Problem --- 
-        const problem = getRandomEasyProblem();
-        setSelectedProblem(problem);
-        console.log(`Selected problem for battle ${lobbyCode}: ${problem.title}`);
-        // ------------------------
+        // Check if the game is already completed
+        if (lobbyData.status === 'completed' && lobbyData.winner_id) {
+          console.log(`Game already completed. Winner: ${lobbyData.winner_id}`);
+          
+          // Check if the current user is the winner
+          if (lobbyData.winner_id === user?.uid) {
+            setHasWon(true);
+            setGameOver(true);
+          } else {
+            setHasLost(true);
+            setWinnerName(lobbyData.winner_name || 'Opponent');
+            setGameOver(true);
+          }
+        }
 
-        // Set initial code based on default language
-        const initialCode = problem.starterCode[currentLanguage] || '';
-        setMyCode(initialCode);
+        // Determine if user is host
+        const userIsHost = user?.uid === lobbyData.host_id;
+        setIsHost(userIsHost);
+
+        // Set up channel with both players subscribed
+        const channel = supabase.channel(`battle_${lobbyCode}`, {
+          config: {
+            broadcast: { self: true }, // Include self in broadcasts
+            presence: { key: user?.uid || 'guest' }
+          }
+        });
+
+        // Define problem selection listener for challenger
+        if (!userIsHost) {
+          console.log("Challenger: Setting up problem selection listener");
+          channel.on('broadcast', { event: 'problem_selected' }, (payload) => {
+            try {
+              const problemId = payload.payload.problemId;
+              if (problemId) {
+                console.log(`Challenger: Received problem ID ${problemId} from host`);
+                const problem = getProblemById(problemId);
+                console.log(`Challenger: Using problem ${problem.title}`);
+                
+                setSelectedProblem(problem);
+                
+                // Set code after problem is determined
+                const initialCode = problem.starterCode[currentLanguage] || '';
+                setMyCode(initialCode);
+              }
+            } catch (e) {
+              console.error("Error processing problem selection:", e);
+              setError("Error processing problem from host");
+            }
+          });
+        }
+
+        // Subscribe to database changes for lobby status
+        const lobbySubscription = supabase
+          .channel('lobby_status_changes')
+          .on(
+            'postgres_changes',
+            {
+              event: 'UPDATE',
+              schema: 'public',
+              table: 'lobbies',
+              filter: `code=eq.${lobbyCode}`
+            },
+            (payload) => {
+              console.log('Lobby update received:', payload);
+              
+              // Check if game completed
+              if (payload.new.status === 'completed' && payload.new.winner_id) {
+                const winnerId = payload.new.winner_id;
+                const winnerName = payload.new.winner_name || 'Opponent';
+                
+                if (winnerId === user?.uid) {
+                  console.log('You won the game!');
+                  setHasWon(true);
+                } else {
+                  console.log(`${winnerName} won the game.`);
+                  setHasLost(true);
+                  setWinnerName(winnerName);
+                }
+                
+                setGameOver(true);
+                
+                // Show appropriate toast
+                if (winnerId === user?.uid) {
+                  toast({
+                    title: "Victory!",
+                    description: "You've successfully solved all test cases!",
+                    variant: "default"
+                  });
+                } else {
+                  toast({
+                    title: "Battle Lost",
+                    description: `${winnerName} has completed all test cases!`,
+                    variant: "destructive"
+                  });
+                }
+              }
+            }
+          )
+          .subscribe();
+
+        // Subscribe to the channel
+        await channel.subscribe(status => {
+          console.log(`Battle channel status: ${status}`);
+          
+          // For host: Send problem ID after successful subscription
+          if (status === 'SUBSCRIBED' && userIsHost) {
+            // Select problem after successful subscription
+            setTimeout(() => {
+              try {
+                const problem = getRandomEasyProblem();
+                console.log(`Host: Selected problem ${problem.title} (${problem.id})`);
+                
+                // First set locally
+                setSelectedProblem(problem);
+                
+                // Set initial code
+                const initialCode = problem.starterCode[currentLanguage] || '';
+                setMyCode(initialCode);
+                
+                // Then broadcast to challenger with a delay to ensure subscription
+                console.log(`Host: Broadcasting problem ID ${problem.id} to challenger`);
+                channel.send({
+                  type: 'broadcast',
+                  event: 'problem_selected',
+                  payload: {
+                    problemId: problem.id,
+                    timestamp: new Date().toISOString()
+                  }
+                });
+              } catch (e) {
+                console.error("Host: Error selecting problem:", e);
+                setError("Error selecting problem");
+              }
+            }, 1000); // Wait 1 second after subscription before sending
+          }
+        });
+        
+        setBattleChannel(channel);
 
         // Set up initial battle state
         const initialBattleState: BattleState = {
           lobbyCode,
           hostId: lobbyData.host_id,
           opponentId: lobbyData.opponent_id,
-          status: 'preparing',
-          problemId: problem.id
+          status: 'preparing'
         };
 
         setBattleState(initialBattleState);
-        setIsHost(user?.uid === lobbyData.host_id);
-
-        // Subscribe only once
-        await channel.subscribe((status) => {
-          console.log(`Battle channel subscription status: ${status}`);
-        });
-
-        setBattleChannel(channel);
-
+        setIsLoading(false);
+        
+        // Cleanup function
+        return () => {
+          console.log('Cleaning up battle resources');
+          if (channel) {
+            channel.unsubscribe();
+            supabase.removeChannel(channel);
+          }
+          
+          if (lobbySubscription) {
+            supabase.removeChannel(lobbySubscription);
+          }
+        };
       } catch (error: any) {
         console.error('Error setting up battle:', error);
         setError(error.message);
@@ -176,21 +302,11 @@ export default function Battle() {
           description: error.message,
           variant: "destructive"
         });
-      } finally {
         setIsLoading(false);
       }
     };
 
     setupBattle();
-
-    // Cleanup
-    return () => {
-      console.log('Cleaning up battle subscriptions');
-      if (channel) {
-        channel.unsubscribe();
-        supabase.removeChannel(channel);
-      }
-    };
   }, [lobbyCode, user, isAuthenticated, navigate, toast, currentLanguage]);
 
   // Handle language change
@@ -244,77 +360,635 @@ export default function Battle() {
       // Get the latest code directly from the editor
       const latestCode = editorRef.current?.getValue() || myCode;
       
-      // Call Judge0 API through our Supabase Edge Function
-      const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/execute-code`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`
-        },
-        body: JSON.stringify({
-          code: latestCode,
-          language: currentLanguage
-        })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('HTTP Error Response:', {
-          status: response.status,
-          statusText: response.statusText,
-          body: errorText
-        });
-        throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
+      // Get the current problem's test cases
+      const currentProblem = selectedProblem;
+      if (!currentProblem) {
+        setTerminalOutput([{
+          content: 'Error: Problem not found',
+          type: 'error'
+        }]);
+        return;
       }
 
-      const result = await response.json();
-      const output: Array<{ content: string; type?: 'error' | 'success' | 'info' | 'default' }> = [];
-      
-      // Add stdout if there is any
-      if (result.stdout && result.stdout.trim()) {
-        output.push({ content: result.stdout.trim(), type: 'success' });
-      }
-      
-      // Add compile errors if any
-      if (result.compile_output) {
-        output.push({ 
-          content: result.compile_output.trim() || '[Empty]',
-          type: 'error'
-        });
-      }
-      
-      // Add runtime errors if any
-      if (result.stderr) {
-        output.push({ 
-          content: result.stderr.trim() || '[Empty]',
-          type: 'error'
-        });
-      }
-      
-      // Add error message if any
-      if (result.error) {
-        output.push({ 
-          content: result.error,
-          type: 'error'
-        });
-      }
-      
-      setTerminalOutput(output);
+      // Create wrapper code based on problem type and language
+      let wrapperCode = '';
+      if (currentLanguage === 'python') {
+        wrapperCode = `
+${latestCode}
 
-    } catch (error: any) {
+error_occurred = False
+error_message = ""
+
+def execute_user_code():
+    global error_occurred, error_message
+    if error_occurred: return
+    try:
+        solution = Solution()
+        # Run the solution with a sample input
+        sample_input = ${JSON.stringify(currentProblem.testCases[0].input)}
+        
+        # Get the function name from the problem ID using leetcode convention
+        function_name_map = {
+            'two-sum': 'twoSum',
+            'palindrome-number': 'isPalindrome',
+            'roman-to-integer': 'romanToInt',
+            'valid-parentheses': 'isValid',
+            'merge-two-sorted-lists': 'mergeTwoLists',
+            'contains-duplicate': 'containsDuplicate',
+            'maximum-subarray': 'maxSubArray',
+            'climbing-stairs': 'climbStairs',
+            'best-time-to-buy-and-sell-stock': 'maxProfit'
+        }
+        function_name = function_name_map.get('${currentProblem.id}')
+        if not function_name:
+            # Fallback to camelCase if not in map
+            function_name = ''.join(word.capitalize() for word in '${currentProblem.id}'.split('-'))
+            function_name = function_name[0].lower() + function_name[1:]
+        
+        # Get the function from the solution class
+        func = getattr(solution, function_name)
+        
+        # Call the function with appropriate arguments
+        if '${currentProblem.id}' == 'two-sum':
+            result = func(sample_input["nums"], sample_input["target"])
+        else:
+            # For all other problems, pass the first key's value from the input
+            first_key = list(sample_input.keys())[0]
+            result = func(sample_input[first_key])
+            
+        print("Function output: " + str(result))
+        
+    except Exception as e:
+        error_occurred = True
+        error_message = "Error executing code: " + str(e)
+        print(chr(10) + "__FIRST_ERROR__")
+        print(error_message)
+
+def run_tests():
+    global error_occurred, error_message
+    if error_occurred: return
+    try:
+        solution = Solution()
+        test_cases = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input))}
+        expected_outputs = [${currentProblem.testCases.map(tc => 
+          typeof tc.expectedOutput === 'boolean' 
+            ? tc.expectedOutput ? 'True' : 'False'
+            : JSON.stringify(tc.expectedOutput)
+        ).join(',')}]
+        passed = 0
+        total = len(test_cases)
+        first_test_error_details = None
+        test_results_details = []
+        
+        # Get the function name from the problem ID using leetcode convention
+        function_name_map = {
+            'two-sum': 'twoSum',
+            'palindrome-number': 'isPalindrome',
+            'roman-to-integer': 'romanToInt',
+            'valid-parentheses': 'isValid',
+            'merge-two-sorted-lists': 'mergeTwoLists',
+            'contains-duplicate': 'containsDuplicate',
+            'maximum-subarray': 'maxSubArray',
+            'climbing-stairs': 'climbStairs',
+            'best-time-to-buy-and-sell-stock': 'maxProfit'
+        }
+        function_name = function_name_map.get('${currentProblem.id}')
+        if not function_name:
+            # Fallback to camelCase if not in map
+            function_name = ''.join(word.capitalize() for word in '${currentProblem.id}'.split('-'))
+            function_name = function_name[0].lower() + function_name[1:]
+        
+        # Get the function from the solution class
+        func = getattr(solution, function_name)
+        
+        for i, (test, expected) in enumerate(zip(test_cases, expected_outputs)):
+            if error_occurred: break
+            result_val = None
+            error_val = None
+            match_status = False
+            try:
+                # Call the function with appropriate arguments
+                if '${currentProblem.id}' == 'two-sum':
+                    result_val = func(test["nums"], test["target"])
+                else:
+                    # For all other problems, pass the first key's value from the input
+                    first_key = list(test.keys())[0]
+                    result_val = func(test[first_key])
+                
+                # Compare results
+                if isinstance(expected, bool):
+                    match_status = result_val == expected
+                else:
+                    match_status = result_val == expected
+                
+                if match_status:
+                    passed += 1
+                    
+            except Exception as e:
+                error_val = str(e)
+                if first_test_error_details is None:
+                    first_test_error_details = (i + 1, error_val)
+                    error_occurred = True
+                    error_message = "Error in test case " + str(i + 1) + ": " + error_val
+                    print(chr(10) + "__FIRST_ERROR__")
+                    print(error_message)
+                    return
+            
+            test_results_details.append({
+                'test_num': i + 1,
+                'input': test,
+                'expected': expected,
+                'actual': result_val,
+                'error': error_val,
+                'passed': match_status
+            })
+        
+        if not error_occurred:
+            print(chr(10) + "__TEST_DETAILS__")
+            for res in test_results_details:
+                print("Test case " + str(res['test_num']) + ":")
+                print("Input: " + str(res['input']))
+                print("Expected: " + str(res['expected']))
+                if res['error']:
+                    print("Error: " + str(res['error']))
+                else:
+                    print("Output: " + str(res['actual']))
+                print("Status: [" + str('PASS' if res['passed'] else 'FAIL') + "]")
+                print("")
+            print(chr(10) + "__TEST_RESULTS_SUMMARY__")
+            print(str(passed) + "/" + str(total))
+
+    except Exception as e:
+        if not error_occurred:
+            error_occurred = True
+            error_message = "Error running tests: " + str(e)
+            print(chr(10) + "__FIRST_ERROR__")
+            print(error_message)
+
+# --- Execution Order --- # 
+execute_user_code()
+run_tests()`;
+      } else if (currentLanguage === 'javascript') {
+        wrapperCode = `
+${latestCode}
+
+function executeUserCode() {
+    try {
+        const solution = new Solution();
+        // Run the solution with a sample input
+        const sampleInput = ${JSON.stringify(currentProblem.testCases[0].input)};
+        
+        // Get the function name from the problem ID using leetcode convention
+        const functionNameMap = {
+            'two-sum': 'twoSum',
+            'palindrome-number': 'isPalindrome',
+            'roman-to-integer': 'romanToInt',
+            'valid-parentheses': 'isValid',
+            'merge-two-sorted-lists': 'mergeTwoLists',
+            'contains-duplicate': 'containsDuplicate',
+            'maximum-subarray': 'maxSubArray',
+            'climbing-stairs': 'climbStairs',
+            'best-time-to-buy-and-sell-stock': 'maxProfit'
+        };
+        
+        const functionName = functionNameMap['${currentProblem.id}'] || '${currentProblem.id}'.split('-')
+            .map((word, i) => i === 0 ? word : word[0].toUpperCase() + word.slice(1))
+            .join('');
+        
+        // Call the function with appropriate arguments
+        let result;
+        if ('${currentProblem.id}' === 'two-sum') {
+            result = solution[functionName](sampleInput.nums, sampleInput.target);
+        } else {
+            // For all other problems, pass the first key's value from the input
+            const firstKey = Object.keys(sampleInput)[0];
+            result = solution[functionName](sampleInput[firstKey]);
+        }
+        console.log("Function output:", result);
+    } catch (e) {
+        console.log("\\n__FIRST_ERROR__");
+        console.log("Error executing code:", e.message);
+        throw e;  // Re-throw to stop execution
+    }
+}
+
+function runTests() {
+    const solution = new Solution();
+    const testCases = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input))};
+    const expectedOutputs = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
+    let passed = 0;
+    const total = testCases.length;
+    
+    // Get the function name from the problem ID using leetcode convention
+    const functionNameMap = {
+        'two-sum': 'twoSum',
+        'palindrome-number': 'isPalindrome',
+        'roman-to-integer': 'romanToInt',
+        'valid-parentheses': 'isValid',
+        'merge-two-sorted-lists': 'mergeTwoLists',
+        'contains-duplicate': 'containsDuplicate',
+        'maximum-subarray': 'maxSubArray',
+        'climbing-stairs': 'climbStairs',
+        'best-time-to-buy-and-sell-stock': 'maxProfit'
+    };
+    
+    const functionName = functionNameMap['${currentProblem.id}'] || '${currentProblem.id}'.split('-')
+        .map((word, i) => i === 0 ? word : word[0].toUpperCase() + word.slice(1))
+        .join('');
+    
+    for (let i = 0; i < testCases.length; i++) {
+        try {
+            const test = testCases[i];
+            const expected = expectedOutputs[i];
+            let result;
+            
+            // Call the function with appropriate arguments
+            if ('${currentProblem.id}' === 'two-sum') {
+                result = solution[functionName](test.nums, test.target);
+            } else {
+                // For all other problems, pass the first key's value from the input
+                const firstKey = Object.keys(test)[0];
+                result = solution[functionName](test[firstKey]);
+            }
+            
+            // Compare results
+            const matches = JSON.stringify(result) === JSON.stringify(expected);
+            if (matches) passed++;
+            
+        } catch (e) {
+            console.log("\\n__FIRST_ERROR__");
+            console.log("Error in test case " + (i + 1) + ":", e.message);
+            return;  // Stop on first error
+        }
+    }
+    
+    console.log("\\n__TEST_RESULTS_SUMMARY__");
+    console.log(passed + "/" + total);
+}
+
+try {
+    executeUserCode();
+    runTests();
+} catch (e) {
+    // Errors are already logged
+}`;
+      } else if (currentLanguage === 'java') {
+        wrapperCode = `
+public class Main {
+    ${latestCode}
+    
+    public static void main(String[] args) {
+        Solution solution = new Solution();
+        
+        // Execute user code with sample input
+        try {
+            if ("${currentProblem.id}".equals("two-sum")) {
+                int[] nums = ${JSON.stringify(currentProblem.testCases[0].input.nums)};
+                int target = ${currentProblem.testCases[0].input.target};
+                int[] result = solution.twoSum(nums, target);
+                System.out.println("Function output: " + java.util.Arrays.toString(result));
+            } else if ("${currentProblem.id}".equals("valid-parentheses")) {
+                String s = ${JSON.stringify(currentProblem.testCases[0].input.s)};
+                boolean result = solution.isValid(s);
+                System.out.println("Function output: " + result);
+            } else if ("${currentProblem.id}".equals("merge-two-sorted-lists")) {
+                int[] list1 = ${JSON.stringify(currentProblem.testCases[0].input.list1)};
+                int[] list2 = ${JSON.stringify(currentProblem.testCases[0].input.list2)};
+                int[] result = solution.mergeTwoLists(list1, list2);
+                System.out.println("Function output: " + java.util.Arrays.toString(result));
+            }
+        } catch (Exception e) {
+            System.out.println("Function output: Error - " + e.getMessage());
+        }
+        
+        // Run tests
+        int passed = 0;
+        int total = ${currentProblem.testCases.length};
+        
+        for (int i = 0; i < total; i++) {
+            try {
+                boolean matches = false;
+                
+                if ("${currentProblem.id}".equals("two-sum")) {
+                    int[] nums = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.nums))};
+                    int target = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.target))};
+                    int[] expected = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
+                    int[] result = solution.twoSum(nums, target);
+                    matches = java.util.Arrays.equals(result, expected);
+                } else if ("${currentProblem.id}".equals("valid-parentheses")) {
+                    String s = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.s))};
+                    boolean expected = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
+                    boolean result = solution.isValid(s);
+                    matches = result == expected;
+                } else if ("${currentProblem.id}".equals("merge-two-sorted-lists")) {
+                    int[] list1 = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.list1))};
+                    int[] list2 = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.list2))};
+                    int[] expected = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
+                    int[] result = solution.mergeTwoLists(list1, list2);
+                    matches = java.util.Arrays.equals(result, expected);
+                }
+                
+                if (matches) passed++;
+            } catch (Exception e) {
+                continue;
+            }
+        }
+        
+        System.out.println("\n__TEST_RESULTS_SUMMARY__");
+        System.out.println(passed + "/" + total);
+    }
+}`;
+      }
+      
+      console.log("Wrapped code being sent to Judge0:", wrapperCode);
+      
+      try {
+        // Call Judge0 API through our Supabase Edge Function
+        const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/execute-code`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`
+          },
+          body: JSON.stringify({
+            code: wrapperCode,
+            language: currentLanguage
+          })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('HTTP Error Response:', {
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText
+          });
+          throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
+        }
+
+        const data = await response.json();
+        console.log("Judge0 API Response:", data);
+
+        // Terminal Output Processing  
+        const terminalMessages: Array<{ content: string; type?: 'error' | 'success' | 'info' | 'default' }> = [];
+        let isErrorState = false;
+
+        // Handle all errors first
+        if (data.compile_output) {
+          terminalMessages.push({
+            content: `Compilation Error:\n${data.compile_output}`,
+            type: 'error'
+          });
+          isErrorState = true;
+        }
+
+        if (data.stderr) {
+          // Add stderr to terminal messages
+          const errorMessage = data.stderr.trim();
+          if (errorMessage) {
+            terminalMessages.push({
+              content: `Runtime Error:\n${errorMessage}`,
+              type: 'error'
+            });
+            isErrorState = true;
+          }
+        }
+
+        if (data.stdout && !isErrorState) {
+          const errorMarker = "__FIRST_ERROR__";
+          const detailsMarker = "\n__TEST_DETAILS__";
+          const summaryMarker = "\n__TEST_RESULTS_SUMMARY__";
+          
+          const errorIndex = data.stdout.indexOf(errorMarker);
+          const detailsIndex = data.stdout.indexOf(detailsMarker);
+          
+          if (errorIndex !== -1) {
+            // Error occurred during Python execution/tests
+            const errorMessage = data.stdout.substring(errorIndex + errorMarker.length).trim();
+            if (errorMessage) {
+              terminalMessages.push({
+                content: errorMessage, 
+                type: 'error'
+              });
+              isErrorState = true;
+            }
+          } else if (detailsIndex !== -1 && !isErrorState) {
+            // Only process successful test details if there are no errors
+            const functionOutputText = data.stdout.substring(0, detailsIndex).trim();
+            if (functionOutputText) {
+              console.log("Function Output (not displayed in Output tab):", functionOutputText);
+            }
+
+            const detailsAndSummary = data.stdout.substring(detailsIndex + detailsMarker.length);
+            const summaryIndex = detailsAndSummary.indexOf(summaryMarker);
+            const testDetails = detailsAndSummary.substring(0, summaryIndex).trim();
+            const summaryLine = detailsAndSummary.substring(summaryIndex + summaryMarker.length).trim();
+
+            // Do NOT add function output to terminal messages - Output tab should be empty on success
+            
+            // Only parse test details if there are no errors
+            try {
+              const testLines = testDetails.split('\n\n').filter(block => block.trim().length > 0);
+              const parsedResults = testLines.map((testCase, index) => { 
+                // ... (robust parsing logic) ...
+                const lines = testCase.split('\n');
+                let testNum = index + 1;
+                let input = {};
+                let expected = null;
+                let output = null;
+                let error = null;
+                let passed = false;
+                
+                try {
+                  const testNumMatch = lines[0]?.match(/Test case (\d+):/);
+                  if (testNumMatch && testNumMatch[1]) {
+                    testNum = parseInt(testNumMatch[1]);
+                  }
+                  
+                  const inputMatch = lines[1]?.match(/Input: (.*)/);
+                  if (inputMatch && inputMatch[1]) {
+                    try { input = JSON.parse(inputMatch[1]); } catch { input = {}; console.warn("Could not parse input string") }
+                  }
+                  
+                  const expectedMatch = lines[2]?.match(/Expected: (.*)/);
+                  if (expectedMatch && expectedMatch[1]) {
+                    try { expected = JSON.parse(expectedMatch[1]); } catch { expected = expectedMatch[1]; } // Handle bools/strings
+                  }
+                  
+                  const outputLine = lines[3];
+                  if (outputLine?.includes('Error:')) {
+                    error = outputLine.substring(outputLine.indexOf(':')+1).trim();
+                  } else if (outputLine?.includes('Output:')) {
+                    try { output = JSON.parse(outputLine.substring(outputLine.indexOf(':')+1)); } catch { output = outputLine.substring(outputLine.indexOf(':')+1).trim(); }
+                  }
+                  
+                  const statusLine = lines[4];
+                  if (statusLine?.includes('[PASS]')) {
+                    passed = true;
+                  }
+                  
+                } catch (parseError) {
+                  console.error(`Error parsing test case ${testNum}:`, parseError, testCase);
+                  error = "Error parsing test result";
+                }
+                
+                return {
+                  id: testNum,
+                  input,
+                  expected,
+                  ...(error ? { error } : { output }),
+                  passed
+                };
+              });
+              
+              const summaryMatch = summaryLine.match(/(\d+)\/(\d+)/);
+              const passedCount = summaryMatch ? parseInt(summaryMatch[1]) : 0;
+              const totalCount = summaryMatch ? parseInt(summaryMatch[2]) : parsedResults.length;
+
+              const newTestResults = {
+                passed: passedCount === totalCount,
+                message: passedCount === totalCount ? 'All test cases passed!' : 'Some test cases failed.',
+                testCasesPassed: passedCount,
+                totalTestCases: totalCount,
+                details: parsedResults
+              };
+              
+              console.log("Test Results Summary:", {
+                passedCount,
+                totalCount,
+                allPassed: passedCount === totalCount,
+                testResults: newTestResults
+              });
+              
+              setTestResults(newTestResults);
+              
+              // Check if all test cases passed and declare victory
+              if (passedCount === totalCount && totalCount > 0 && !gameOver) {
+                console.log('🏆 VICTORY CONDITION MET:', {
+                  passedCount,
+                  totalCount,
+                  gameOver,
+                  userId: user?.uid
+                });
+                
+                try {
+                  // Update the lobby in the database
+                  const { data, error: updateError } = await supabase
+                    .from('lobbies')
+                    .update({
+                      status: 'completed',
+                      winner_id: user?.uid,
+                      winner_name: user?.displayName || 'Anonymous Player'
+                    })
+                    .eq('code', lobbyCode)
+                    .select();
+                    
+                  if (updateError) {
+                    console.error('Error updating lobby with winner:', updateError);
+                  } else {
+                    console.log('Successfully updated lobby with winner information:', data);
+                  }
+                  
+                  // Set local state immediately
+                  setHasWon(true);
+                  setGameOver(true);
+                  
+                  // Show winning toast
+                  toast({
+                    title: "Victory!",
+                    description: "You've successfully solved all test cases!",
+                    variant: "default"
+                  });
+                } catch (e) {
+                  console.error('Error updating lobby status:', e);
+                }
+              }
+
+            } catch(parsingError) {
+               console.error("Error processing test details:", parsingError);
+               terminalMessages.push({ content: "Error displaying test results.", type: 'error' });
+               isErrorState = true; // Treat parsing failure as an error state
+            }
+            
+          } else if (!isErrorState) {
+            // Only add stdout to terminal if it wasn't handled as test results or error
+            // and if no error state was already set
+            if (data.stdout.trim()) {
+                terminalMessages.push({
+                  content: data.stdout,
+                  type: 'default'
+                });
+            }
+          }
+        }
+
+        // Set terminal output (may be empty for successful runs)
+        setTerminalOutput(terminalMessages);
+        
+        // ALWAYS show Output tab for any errors, and Test Cases tab otherwise
+        if (isErrorState) {
+          setActiveTerminalTab('output');
+          console.log("Setting tab to OUTPUT due to errors");
+        } else {
+          // If no errors, always show Test Cases tab if we have test results
+          // This ensures consistent behavior across all problems
+          if (data.stdout && data.stdout.includes("__TEST_RESULTS_SUMMARY__")) {
+            setTestResults(prevResults => {
+              if (!prevResults) {
+                // Create a default test results object if parsing failed but we have summary
+                const summaryMatch = data.stdout.match(/(\d+)\/(\d+)/);
+                if (summaryMatch) {
+                  const passedCount = parseInt(summaryMatch[1]);
+                  const totalCount = parseInt(summaryMatch[2]);
+                  return {
+                    passed: passedCount === totalCount,
+                    message: passedCount === totalCount ? 'All test cases passed!' : 'Some test cases failed.',
+                    testCasesPassed: passedCount,
+                    totalTestCases: totalCount,
+                    details: []
+                  };
+                }
+              }
+              return prevResults;
+            });
+            setActiveTerminalTab('testcases');
+            console.log("Setting tab to TEST CASES - successfully ran tests");
+          } else {
+            // Fallback to output tab if there are no test results at all
+            setActiveTerminalTab('output');
+            console.log("Setting tab to OUTPUT - no test results available");
+          }
+        }
+
+      } catch (error) {
+        console.error('Error running code:', error);
+        setTerminalOutput([{ 
+          content: `Error running code: ${error.message || 'An unknown error occurred'}`,
+          type: 'error'
+        }]);
+        setActiveTerminalTab('output'); // Switch to output tab on error
+        
+        toast({
+          title: "Execution Error",
+          description: error.message || "An error occurred while running your code",
+          variant: "destructive"
+        });
+      } finally {
+        setIsRunning(false);
+      }
+    } catch (error) {
       console.error('Error running code:', error);
       setTerminalOutput([{ 
         content: `Error running code: ${error.message || 'An unknown error occurred'}`,
         type: 'error'
       }]);
+      setActiveTerminalTab('output'); // Switch to output tab on error
       
       toast({
         title: "Execution Error",
         description: error.message || "An error occurred while running your code",
         variant: "destructive"
       });
-    } finally {
-      setIsRunning(false);
     }
   };
   
@@ -335,6 +1009,28 @@ export default function Battle() {
     }
   }, [battleChannel, user]);
 
+  // Add a new function to get a specific problem by ID
+  const getSpecificProblem = (problemId: string): Problem => {
+    // Import from the problemService file
+    const { getRandomEasyProblem, getProblemById } = require('@/problems/problemService');
+    
+    try {
+      const problem = getProblemById(problemId);
+      return problem;
+    } catch (error) {
+      console.error(`Error getting problem with ID ${problemId}:`, error);
+      // Fallback to a random problem if the specific one can't be found
+      return getRandomEasyProblem();
+    }
+  };
+
+  // Add a helper function to get a fixed fallback problem to increase chance of match
+  const getFixedFallbackProblem = (): Problem => {
+    // Always return the "Two Sum" problem as fallback for consistency
+    // This increases chances both players get the same problem even on failure
+    return getProblemById('two-sum');
+  };
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -346,14 +1042,26 @@ export default function Battle() {
     );
   }
 
-  if (error || !battleState || !selectedProblem) {
+  if (error || !battleState) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <Card className="p-6 max-w-md">
           <h2 className="text-2xl font-bold mb-4">Battle Error</h2>
-          <p className="text-muted-foreground mb-4">{error || 'Could not initialize battle or load problem'}</p>
+          <p className="text-muted-foreground mb-4">{error || 'Could not initialize battle'}</p>
           <Button onClick={() => navigate('/find-match')}>Return to Lobby</Button>
         </Card>
+      </div>
+    );
+  }
+
+  // Ensure we have a problem before rendering the battle UI
+  if (!selectedProblem) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="text-center">
+          <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4" />
+          <p className="text-muted-foreground">Loading problem...</p>
+        </div>
       </div>
     );
   }
@@ -370,6 +1078,20 @@ export default function Battle() {
             <Badge variant={isHost ? "default" : "secondary"} className="font-mono text-xs px-2 py-0.5">
               {isHost ? 'Host' : 'Challenger'}
             </Badge>
+            
+            {/* Game Status Badge */}
+            {hasWon && (
+              <Badge variant="success" className="ml-2 animate-pulse">
+                <Crown className="h-3 w-3 mr-1" />
+                Victory!
+              </Badge>
+            )}
+            {hasLost && (
+              <Badge variant="destructive" className="ml-2">
+                <X className="h-3 w-3 mr-1" />
+                Defeated
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-3">
             {isPremium && (
@@ -480,11 +1202,44 @@ export default function Battle() {
                   onChange={handleCodeChange}
                   onMount={handleEditorDidMount}
                 />
+                
+                {/* Game Over Overlay */}
+                {gameOver && (
+                  <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex flex-col items-center justify-center z-10">
+                    <div className="text-center p-6 rounded-lg">
+                      {hasWon ? (
+                        <>
+                          <Crown className="h-16 w-16 text-amber-500 mx-auto mb-4" />
+                          <h2 className="text-2xl font-bold text-amber-500 mb-2">Victory!</h2>
+                          <p className="text-lg mb-4">You've solved all test cases.</p>
+                        </>
+                      ) : (
+                        <>
+                          <Shield className="h-16 w-16 text-destructive mx-auto mb-4" />
+                          <h2 className="text-2xl font-bold text-destructive mb-2">Defeated</h2>
+                          <p className="text-lg mb-4">{winnerName} solved all test cases first.</p>
+                        </>
+                      )}
+                      <Button 
+                        onClick={() => navigate('/find-match')} 
+                        variant="outline"
+                        className="mt-4"
+                      >
+                        Find New Match
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </div>
               
               {/* Terminal Section */}
-              <div className="p-4">
-                <Terminal output={terminalOutput} />
+              <div className="h-[30vh] p-4">
+                <Terminal 
+                  output={terminalOutput} 
+                  testResults={testResults} 
+                  activeTab={activeTerminalTab}
+                  setActiveTab={setActiveTerminalTab}
+                />
               </div>
             </CardContent>
 
@@ -493,7 +1248,7 @@ export default function Battle() {
                 <div className="flex items-center justify-between mb-4">
                   <Button 
                     onClick={runCode}
-                    disabled={isRunning}
+                    disabled={isRunning || gameOver}
                     className="gap-2" 
                     size="sm"
                   >
@@ -505,9 +1260,20 @@ export default function Battle() {
                     Run Code
                     <span className="text-xs text-muted-foreground ml-1">(Cmd+Enter)</span>
                   </Button>
+                  
+                  {/* Game status text */}
+                  {gameOver && (
+                    <div className="text-sm">
+                      {hasWon ? (
+                        <span className="text-green-500 font-medium">You won the battle!</span>
+                      ) : (
+                        <span className="text-destructive font-medium">Battle ended</span>
+                      )}
+                    </div>
+                  )}
                 </div>
                 
-                {/* Test Results */}
+                {/* Test Results Progress Bar */}
                 {testResults && (
                   <div className="space-y-3 text-sm">
                     <div className="w-full bg-muted rounded-full h-1.5">
@@ -515,51 +1281,6 @@ export default function Battle() {
                         className={`h-1.5 rounded-full ${testResults.passed ? 'bg-green-500' : 'bg-yellow-500'}`}
                         style={{ width: `${(testResults.testCasesPassed / testResults.totalTestCases) * 100}%` }}
                       ></div>
-                    </div>
-                    
-                    {/* Show test case details */}
-                    <div className="space-y-2 mt-2">
-                      {testResults.details
-                        .filter(result => result.id <= 3) // Only show example test cases
-                        .map(result => (
-                          <div 
-                            key={result.id}
-                            className={`p-2 text-xs rounded-md flex items-start gap-2 ${
-                              result.passed 
-                                ? 'bg-green-500/10 border border-green-500/20' 
-                                : 'bg-red-500/10 border border-red-500/20'
-                            }`}
-                          >
-                            <div className={`mt-0.5 ${result.passed ? 'text-green-500' : 'text-red-500'}`}>
-                              {result.passed ? (
-                                <Check className="h-4 w-4" />
-                              ) : (
-                                <X className="h-4 w-4" />
-                              )}
-                            </div>
-                            <div className="flex-1 overflow-hidden">
-                              <div className="font-mono">
-                                <span className="text-muted-foreground">Input:</span>{' '}
-                                <span>{JSON.stringify(result.input)}</span>
-                              </div>
-                              <div className="font-mono mt-1">
-                                <span className="text-muted-foreground">Expected:</span>{' '}
-                                <span>{JSON.stringify(result.expected)}</span>
-                              </div>
-                              {!result.passed && result.output !== undefined && (
-                                <div className="font-mono mt-1">
-                                  <span className="text-muted-foreground">Output:</span>{' '}
-                                  <span className="text-red-400">{JSON.stringify(result.output)}</span>
-                                </div>
-                              )}
-                              {result.error && (
-                                <div className="font-mono mt-1 text-red-400 break-all">
-                                  Error: {result.error}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        ))}
                     </div>
                   </div>
                 )}
