@@ -9,7 +9,7 @@ import { Loader2, Users, Crown, Shield, BookOpen, Play, Check, X, ArrowRight } f
 import { useToast } from '@shared/hooks/ui/use-toast';
 import { supabase } from '@shared/config/supabase';
 import { Problem, TestCase } from '@/problems/problemTypes';
-import { getRandomEasyProblem, submitSolution, getProblemById } from '@/problems/problemService';
+import { getRandomEasyProblem, submitSolution, getProblemById, getRandomProblem } from '@/problems/problemService';
 import CodeEditor from '@shared/components/CodeEditor';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@ui/form/select';
 import { RealtimeChannel } from '@supabase/supabase-js';
@@ -98,15 +98,27 @@ const supportedLanguages: SupportedLanguage[] = ['javascript', 'python', 'java']
 
 const MAX_HEALTH = 100; // Maximum health for each player
 
-// Helper to compute damage based on duration (ms)
-function computeDamage(durationMs: number): number {
+// Helper to compute damage based on duration (ms) and problem difficulty
+function computeDamage(durationMs: number, difficulty: 'easy' | 'medium' | 'hard' = 'easy'): number {
   const secs = durationMs / 1000;
-  if (secs <= 120) return 40; // <=2 minutes
-  if (secs <= 180) return 35; // <=3 minutes
-  if (secs <= 300) return 30; // <=5 minutes
-  if (secs <= 480) return 25; // <=8 minutes
-  if (secs <= 600) return 20; // <=10 minutes
-  return 15; // slower than 10 minutes
+  
+  // Base damage values according to time
+  let baseDamage = 0;
+  if (secs <= 120) baseDamage = 25; // <=2 minutes
+  else if (secs <= 180) baseDamage = 20; // <=3 minutes
+  else if (secs <= 300) baseDamage = 15; // <=5 minutes
+  else if (secs <= 480) baseDamage = 10; // <=8 minutes
+  else if (secs <= 600) baseDamage = 8; // <=10 minutes
+  else baseDamage = 5; // slower than 10 minutes
+  
+  // Difficulty multipliers
+  const difficultyMultiplier = difficulty === 'easy' ? 1 : 
+                              difficulty === 'medium' ? 1.5 : 
+                              2.5; // hard problems
+  
+  // Calculate final damage
+  // This ensures a hard problem solved in under 10 minutes does ~50 damage
+  return Math.round(baseDamage * difficultyMultiplier);
 }
 
 export default function Battle() {
@@ -190,22 +202,72 @@ export default function Battle() {
 
   const [playerHealth, setPlayerHealth] = useState<number>(MAX_HEALTH);
   const [opponentHealth, setOpponentHealth] = useState<number>(MAX_HEALTH);
+  
+  // Add state to track solved problems
+  const [solvedProblemIds, setSolvedProblemIds] = useState<Set<string>>(new Set());
+
+  // Add a ref to track the previous problem ID
+  const previousProblemIdRef = useRef<string | null>(null);
+
+  // Add a helper function to get a random problem that hasn't been solved yet
+  const getUniqueRandomProblem = useCallback((): Problem => {
+    // If we don't have many solved problems yet, just get a random problem
+    if (solvedProblemIds.size < 3) {
+      // Get any random problem first
+      const newProblem = getRandomProblem();
+      
+      // If by chance we've solved this one, try once more
+      if (solvedProblemIds.has(newProblem.id)) {
+        let anotherProblem;
+        do {
+          anotherProblem = getRandomProblem();
+        } while (anotherProblem.id === newProblem.id);
+        return anotherProblem;
+      }
+      
+      return newProblem;
+    }
+    
+    // Try to find a problem that hasn't been solved yet (max 10 attempts)
+    let attempts = 0;
+    let newProblem: Problem;
+    
+    do {
+      newProblem = getRandomProblem();
+      attempts++;
+      // If we've tried 20 times and still can't find a new problem, 
+      // we've probably solved most available problems
+      if (attempts >= 20) {
+        console.log("Could not find unsolved problem after 20 attempts, resetting solved problem tracking");
+        setSolvedProblemIds(new Set());
+        return getRandomProblem();
+      }
+    } while (solvedProblemIds.has(newProblem.id));
+    
+    console.log(`Found unsolved problem ${newProblem.id} after ${attempts} attempts`);
+    return newProblem;
+  }, [solvedProblemIds]);
 
   // Broadcast test results (now includes damage) to opponent
-  const broadcastDamage = useCallback((damage: number) => {
+  const broadcastDamage = useCallback((damage: number, difficulty: 'easy' | 'medium' | 'hard' = 'easy') => {
     if (battleChannel && user?.uid) {
-      console.log('Broadcasting DAMAGE dealt:', damage);
+      console.log('Broadcasting DAMAGE dealt:', damage, 'for difficulty:', difficulty);
+      
+      // Store current problem ID before damage is dealt
+      previousProblemIdRef.current = currentProblemRef.current?.id || selectedProblem?.id;
+      
       battleChannel.send({
         type: 'broadcast',
         event: 'test_results',
         payload: {
           userId: user.uid,
           damage,
+          difficulty,
           timestamp: Date.now()
         }
       });
     }
-  }, [battleChannel, user]);
+  }, [battleChannel, user, currentProblemRef, selectedProblem]);
 
   // Broadcast a new problem ID after a user solves a problem
   const broadcastProblem = useCallback((problemId: string) => {
@@ -231,7 +293,7 @@ export default function Battle() {
     if (!battleChannel || !user?.uid) return;
 
     const handleDamage = (payload: any) => {
-      const { userId: senderId, damage } = payload.payload;
+      const { userId: senderId, damage, difficulty } = payload.payload;
       if (senderId === user.uid) {
         // This is damage we dealt, so update opponent health on our side
         setOpponentHealth(prev => {
@@ -246,7 +308,11 @@ export default function Battle() {
         return;
       }
 
-      console.log('Received DAMAGE from opponent:', damage);
+      console.log('Received DAMAGE from opponent:', damage, 'for difficulty:', difficulty || 'unknown');
+      
+      // Store current problem ID before updating health
+      const currentProblemId = currentProblemRef.current?.id || selectedProblem?.id;
+      
       setPlayerHealth(prev => {
         const newHealth = Math.max(prev - damage, 0);
         if (newHealth === 0) {
@@ -256,12 +322,67 @@ export default function Battle() {
         }
         return newHealth;
       });
+      
+      // Check if we need to force a problem change
+      // This is a safeguard in case the problem didn't change after damage was dealt
+      setTimeout(() => {
+        const afterDamageProblemId = currentProblemRef.current?.id || selectedProblem?.id;
+        
+        if (afterDamageProblemId === currentProblemId) {
+          console.log("PROBLEM STUCK: Problem didn't change after damage was dealt. Forcing problem change.");
+          
+          // Force a new problem only if the game isn't over
+          if (!gameOver && !hasWon && !hasLost) {
+            const newProblem = getUniqueRandomProblem();
+            console.log("Forcing switch to new problem:", newProblem.id);
+            resetProblemState(newProblem, currentLanguage);
+            toast({
+              title: 'Problem Updated',
+              description: 'Switched to a new problem to continue the battle.',
+              variant: 'default'
+            });
+          }
+        }
+      }, 1000); // Give a slight delay to ensure the normal problem change would have happened
     };
 
     battleChannel.on('broadcast', { event: 'test_results' }, handleDamage);
 
     // No reliable off method in current SDK; rely on channel.unsubscribe elsewhere
-  }, [battleChannel, user, toast]);
+  }, [battleChannel, user, toast, currentLanguage, gameOver, hasWon, hasLost]);
+
+  // Check after we complete a problem if the problem actually changed
+  useEffect(() => {
+    // This effect runs after we've dealt damage and the problem should have changed
+    if (previousProblemIdRef.current) {
+      // Wait a bit to ensure the problem has had time to change
+      const timeoutId = setTimeout(() => {
+        const currentProblemId = currentProblemRef.current?.id || selectedProblem?.id;
+        
+        // If still on the same problem after we dealt damage
+        if (currentProblemId && currentProblemId === previousProblemIdRef.current) {
+          console.log("PROBLEM STUCK: Problem didn't change after we dealt damage. Forcing problem change.");
+          
+          // Only force a change if not in game over state
+          if (!gameOver && !hasWon && !hasLost) {
+            const newProblem = getUniqueRandomProblem();
+            console.log("Forcing switch to new problem:", newProblem.id);
+            resetProblemState(newProblem, currentLanguage);
+            toast({
+              title: 'Problem Updated',
+              description: 'Switched to a new problem to continue the battle.',
+              variant: 'default'
+            });
+          }
+        }
+        
+        // Reset the previous problem ID reference after check
+        previousProblemIdRef.current = null;
+      }, 1500);
+      
+      return () => clearTimeout(timeoutId);
+    }
+  }, [opponentHealth, playerHealth, gameOver, hasWon, hasLost, getUniqueRandomProblem, currentLanguage]);
 
   // Modify useEffect for listener (add after existing damage listener) - create a new effect
   useEffect(() => {
@@ -1241,23 +1362,45 @@ public class Main {
                 const currentStartTime = startTimeRef.current;
                 const durationMs = currentStartTime ? endTime - currentStartTime : 0;
                 const formattedDuration = formatDuration(durationMs);
-                const damageDealt = computeDamage(durationMs);
+                
+                // Get the current problem from the currentProblemRef or selectedProblem
+                // This ensures we're using the actual problem the user is currently working on
+                const currentProblem = currentProblemRef.current || selectedProblem;
+                
+                // Get the difficulty from the current problem
+                const currentDifficulty = currentProblem?.difficulty || 'easy';
+                const damageDealt = computeDamage(durationMs, currentDifficulty);
 
                 // Add extra logging to confirm gameOver state before and after damage is dealt
                 console.log("BUTTON DEBUG - All tests passed:", {
                   gameOverBefore: gameOver,
                   hasWonBefore: hasWon,
-                  hasLostBefore: hasLost
+                  hasLostBefore: hasLost,
+                  currentProblem: currentProblem?.id,
+                  difficulty: currentDifficulty
                 });
+
+                // Track this problem as solved 
+                if (currentProblem?.id) {
+                  setSolvedProblemIds(prev => {
+                    const newSet = new Set(prev);
+                    newSet.add(currentProblem.id);
+                    return newSet;
+                  });
+                  
+                  console.log(`Added problem ${currentProblem.id} to solved problems, total solved: ${solvedProblemIds.size + 1}`);
+                }
 
                 // EXPLICITLY ensure gameOver is false since we're continuing the game
                 setGameOver(false);
 
                 // Broadcast damage to opponent (also updates our opponent health locally in listener)
-                broadcastDamage(damageDealt);
+                broadcastDamage(damageDealt, currentDifficulty);
 
-                // Reset timer and fetch new problem for the solver (random easy)
-                const newProblem = getRandomEasyProblem();
+                // Get a unique problem that hasn't been solved yet
+                const newProblem = getUniqueRandomProblem();
+                
+                // Update the current problem reference and state
                 resetProblemState(newProblem, currentLanguage);
 
                 // Log game state after problem reset
@@ -1266,12 +1409,13 @@ public class Main {
                   hasWonAfter: hasWon,
                   hasLostAfter: hasLost,
                   newProblemLoaded: true,
-                  newProblemId: newProblem.id
+                  newProblemId: newProblem.id,
+                  prevProblemId: currentProblem?.id
                 });
 
                 toast({
                   title: 'Problem Solved!',
-                  description: `Dealt ${damageDealt} damage in ${formattedDuration}. Next problem loaded!`,
+                  description: `Dealt ${damageDealt} damage for solving a ${currentDifficulty} problem in ${formattedDuration}. Next problem loaded!`,
                   variant: 'default'
                 });
 
@@ -1385,7 +1529,7 @@ public class Main {
     }
   }, [battleChannel, user]);
 
-  // Add a new function to get a specific problem by ID
+  // Add a helper function to get a specific problem by ID
   const getSpecificProblem = (problemId: string): Problem => {
     // Import from the problemService file
     const { getRandomEasyProblem, getProblemById } = require('@/problems/problemService');
