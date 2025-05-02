@@ -170,6 +170,9 @@ export default function Battle() {
   // Use useRef for start time to avoid stale closures in runCode
   const startTimeRef = useRef<number | null>(null);
 
+  // Add this after other useRef declarations (around line 131)
+  const currentProblemRef = useRef<Problem | null>(null);
+
   // Debounced function to broadcast code updates
   const broadcastCodeUpdate = useCallback(debounce((channel: RealtimeChannel | null, code: string) => {
     if (channel && user?.uid) {
@@ -198,6 +201,22 @@ export default function Battle() {
         payload: {
           userId: user.uid,
           damage,
+          timestamp: Date.now()
+        }
+      });
+    }
+  }, [battleChannel, user]);
+
+  // Broadcast a new problem ID after a user solves a problem
+  const broadcastProblem = useCallback((problemId: string) => {
+    if (battleChannel && user?.uid) {
+      console.log('Broadcasting NEW PROBLEM:', problemId);
+      battleChannel.send({
+        type: 'broadcast',
+        event: 'problem_selected',
+        payload: {
+          userId: user.uid,
+          problemId,
           timestamp: Date.now()
         }
       });
@@ -240,6 +259,30 @@ export default function Battle() {
 
     // No reliable off method in current SDK; rely on channel.unsubscribe elsewhere
   }, [battleChannel, user, toast]);
+
+  // Modify useEffect for listener (add after existing damage listener) - create a new effect
+  useEffect(() => {
+    if (!battleChannel || !user?.uid) return;
+
+    const handleProblemSelected = (payload: any) => {
+      const { userId: senderId, problemId } = payload.payload;
+      if (!problemId) return;
+      if (senderId === user.uid) return; // ignore our own broadcast (we already reset locally)
+      try {
+        const problem = getProblemById(problemId);
+        console.log('Received NEW PROBLEM from opponent:', problemId);
+        resetProblemState(problem, currentLanguage);
+      } catch (e) {
+        console.error('Error handling new problem broadcast:', e);
+      }
+    };
+
+    battleChannel.on('broadcast', { event: 'problem_selected' }, handleProblemSelected);
+
+    return () => {
+      // removal not needed; channel unsubscribes elsewhere
+    };
+  }, [battleChannel, user, currentLanguage]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -393,6 +436,7 @@ export default function Battle() {
                   type: 'broadcast',
                   event: 'problem_selected',
                   payload: {
+                    userId: user.uid,
                     problemId: problem.id,
                     timestamp: new Date().toISOString()
                   }
@@ -495,16 +539,24 @@ export default function Battle() {
       // Get the latest code directly from the editor
       const latestCode = editorRef.current?.getValue() || myCode;
       
-      // Get the current problem's test cases
-      const currentProblem = selectedProblem;
-      if (!currentProblem) {
+      // IMPORTANT: Get the most up-to-date problem - either from the ref or state
+      // This ensures we always use the latest problem regardless of React's state update timing
+      const effectiveProblem = currentProblemRef.current || selectedProblem;
+      const currentProblemID = effectiveProblem?.id;
+      
+      if (!currentProblemID) {
         setTerminalOutput([{
-          content: 'Error: Problem not found',
+          content: 'Error: No problem selected',
           type: 'error'
         }]);
+        setIsRunning(false);
         return;
       }
-
+      
+      // Clone the problem to avoid reference issues
+      const currentProblem = {...effectiveProblem};
+      console.log(`Running code for problem: ${currentProblemID}`);
+      
       // Create wrapper code based on problem type and language
       let wrapperCode = '';
       if (currentLanguage === 'python') {
@@ -541,11 +593,11 @@ def execute_user_code():
             # 'merge-two-sorted-lists': 'mergeTwoLists',
             # 'climbing-stairs': 'climbStairs',
         }
-        function_name = function_name_map.get('${currentProblem.id}')
+        function_name = function_name_map.get('${currentProblemID}')  # <<-- Use our stable ID
         if not function_name:
             # Fallback should ideally not be needed if map is complete
             print(chr(10) + "__FIRST_ERROR__")
-            print("Error: Could not determine function name for problem ID: ${currentProblem.id}")
+            print("Error: Could not determine function name for problem ID: ${currentProblemID}")
             error_occurred = True
             error_message = "Internal error: Function name mapping missing."
 
@@ -555,7 +607,7 @@ def execute_user_code():
                 func = getattr(solution, function_name)
             except AttributeError:
                 print(chr(10) + "__FIRST_ERROR__")
-                print(f"Error: Function '{function_name}' not found in Solution class for problem ID '${currentProblem.id}'.")
+                print(f"Error: Function '{function_name}' not found in Solution class for problem ID '${currentProblemID}'.")
                 error_occurred = True
                 error_message = f"Function '{function_name}' not implemented."
 
@@ -571,7 +623,7 @@ def execute_user_code():
                  print("Function output: " + str(result))
             else:
                  print(chr(10) + "__FIRST_ERROR__")
-                 print(f"Error: Mismatch between expected parameters ({param_names}) and provided input keys ({list(sample_input.keys())}) for problem ID '${currentProblem.id}'.")
+                 print(f"Error: Mismatch between expected parameters ({param_names}) and provided input keys ({list(sample_input.keys())}) for problem ID '${currentProblemID}'.")
                  error_occurred = True
                  error_message = "Input/parameter mismatch."
 
@@ -617,11 +669,11 @@ def run_tests():
             # 'merge-two-sorted-lists': 'mergeTwoLists',
             # 'climbing-stairs': 'climbStairs',
         }
-        function_name = function_name_map.get('${currentProblem.id}')
+        function_name = function_name_map.get('${currentProblemID}')
         if not function_name:
             # Fallback should ideally not be needed
             print(chr(10) + "__FIRST_ERROR__")
-            print("Error: Could not determine function name for problem ID: ${currentProblem.id}")
+            print("Error: Could not determine function name for problem ID: ${currentProblemID}")
             error_occurred = True
             error_message = "Internal error: Function name mapping missing."
             return # Stop test execution
@@ -631,7 +683,7 @@ def run_tests():
             func = getattr(solution, function_name)
         except AttributeError:
             print(chr(10) + "__FIRST_ERROR__")
-            print(f"Error: Function '{function_name}' not found in Solution class for problem ID '${currentProblem.id}'.")
+            print(f"Error: Function '{function_name}' not found in Solution class for problem ID '${currentProblemID}'.")
             error_occurred = True
             error_message = f"Function '{function_name}' not implemented."
             return # Stop test execution
@@ -657,7 +709,7 @@ def run_tests():
                 # Simple comparison for now
                 if isinstance(expected, list) and isinstance(result_val, list):
                      # Handle potential list comparison issues (e.g., order for 3sum)
-                     if '${currentProblem.id}' == '3sum':
+                     if '${currentProblemID}' == '3sum':
                          # Sort both lists of lists before comparing for 3sum
                          sorted_result = sorted([sorted(triplet) for triplet in result_val])
                          sorted_expected = sorted([sorted(triplet) for triplet in expected])
@@ -752,13 +804,13 @@ function executeUserCode() {
             'best-time-to-buy-and-sell-stock': 'maxProfit'
         };
         
-        const functionName = functionNameMap['${currentProblem.id}'] || '${currentProblem.id}'.split('-')
+        const functionName = functionNameMap['${currentProblemID}'] || '${currentProblemID}'.split('-')
             .map((word, i) => i === 0 ? word : word[0].toUpperCase() + word.slice(1))
             .join('');
         
         // Call the function with appropriate arguments
         let result;
-        if ('${currentProblem.id}' === 'two-sum') {
+        if ('${currentProblemID}' === 'two-sum') {
             result = solution[functionName](sampleInput.nums, sampleInput.target);
         } else {
             // For all other problems, pass the first key's value from the input
@@ -793,7 +845,7 @@ function runTests() {
         'best-time-to-buy-and-sell-stock': 'maxProfit'
     };
     
-    const functionName = functionNameMap['${currentProblem.id}'] || '${currentProblem.id}'.split('-')
+    const functionName = functionNameMap['${currentProblemID}'] || '${currentProblemID}'.split('-')
         .map((word, i) => i === 0 ? word : word[0].toUpperCase() + word.slice(1))
         .join('');
     
@@ -804,7 +856,7 @@ function runTests() {
             let result;
             
             // Call the function with appropriate arguments
-            if ('${currentProblem.id}' === 'two-sum') {
+            if ('${currentProblemID}' === 'two-sum') {
                 result = solution[functionName](test.nums, test.target);
             } else {
                 // For all other problems, pass the first key's value from the input
@@ -843,16 +895,16 @@ public class Main {
         
         // Execute user code with sample input
         try {
-            if ("${currentProblem.id}".equals("two-sum")) {
+            if ("${currentProblemID}".equals("two-sum")) {
                 int[] nums = ${JSON.stringify(currentProblem.testCases[0].input.nums)};
                 int target = ${currentProblem.testCases[0].input.target};
                 int[] result = solution.twoSum(nums, target);
                 System.out.println("Function output: " + java.util.Arrays.toString(result));
-            } else if ("${currentProblem.id}".equals("valid-parentheses")) {
+            } else if ("${currentProblemID}".equals("valid-parentheses")) {
                 String s = ${JSON.stringify(currentProblem.testCases[0].input.s)};
                 boolean result = solution.isValid(s);
                 System.out.println("Function output: " + result);
-            } else if ("${currentProblem.id}".equals("merge-two-sorted-lists")) {
+            } else if ("${currentProblemID}".equals("merge-two-sorted-lists")) {
                 int[] list1 = ${JSON.stringify(currentProblem.testCases[0].input.list1)};
                 int[] list2 = ${JSON.stringify(currentProblem.testCases[0].input.list2)};
                 int[] result = solution.mergeTwoLists(list1, list2);
@@ -870,18 +922,18 @@ public class Main {
             try {
                 boolean matches = false;
                 
-                if ("${currentProblem.id}".equals("two-sum")) {
+                if ("${currentProblemID}".equals("two-sum")) {
                     int[] nums = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.nums))};
                     int target = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.target))};
                     int[] expected = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
                     int[] result = solution.twoSum(nums, target);
                     matches = java.util.Arrays.equals(result, expected);
-                } else if ("${currentProblem.id}".equals("valid-parentheses")) {
+                } else if ("${currentProblemID}".equals("valid-parentheses")) {
                     String s = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.s))};
                     boolean expected = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
                     boolean result = solution.isValid(s);
                     matches = result == expected;
-                } else if ("${currentProblem.id}".equals("merge-two-sorted-lists")) {
+                } else if ("${currentProblemID}".equals("merge-two-sorted-lists")) {
                     int[] list1 = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.list1))};
                     int[] list2 = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input.list2))};
                     int[] expected = ${JSON.stringify(currentProblem.testCases.map(tc => tc.expectedOutput))};
@@ -904,6 +956,13 @@ public class Main {
       console.log("Wrapped code being sent to Judge0:", wrapperCode);
       
       try {
+        // NEW: Check if problem changed during our preparation - abort if it did
+        if (currentProblemID !== selectedProblem?.id) {
+          console.log("Problem changed during execution, aborting current run");
+          setIsRunning(false);
+          return;
+        }
+        
         // Call Judge0 API through our Supabase Edge Function
         const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/execute-code`, {
           method: 'POST',
@@ -916,6 +975,13 @@ public class Main {
             language: currentLanguage
           })
         });
+        
+        // New: second check if problem changed while waiting for API response
+        if (currentProblemID !== selectedProblem?.id) {
+          console.log("Problem changed during API call, aborting result processing");
+          setIsRunning(false);
+          return;
+        }
 
         if (!response.ok) {
           const errorText = await response.text();
@@ -1076,9 +1142,7 @@ public class Main {
 
                 // Reset timer and fetch new problem for the solver (random easy)
                 const newProblem = getRandomEasyProblem();
-                setSelectedProblem(newProblem);
-                startTimeRef.current = Date.now();
-                setMyCode(newProblem.starterCode[currentLanguage] || '');
+                resetProblemState(newProblem, currentLanguage);
 
                 toast({
                   title: 'Problem Solved!',
@@ -1086,7 +1150,9 @@ public class Main {
                   variant: 'default'
                 });
 
-                // No local hasWon/gameOver set here; handled by health logic.
+                // End the current runCode flow after resetting for next problem
+                setIsRunning(false);
+                return;
               }
 
             } catch(parsingError) {
@@ -1226,6 +1292,33 @@ public class Main {
     }
     // Dependency array only needs things that determine *when* to set the time
   }, [battleState, selectedProblem]); // Removed startTimeRef dependency
+
+  // Add a helper function to properly reset test case state                  
+  const resetProblemState = (newProblem: Problem, language: SupportedLanguage) => {
+    // Store the new problem in the ref for immediate access
+    currentProblemRef.current = newProblem;
+    
+    // Reset UI state
+    setTestResults(null);
+    setTerminalOutput([{
+      content: 'Code execution output will appear here...',
+      type: 'default'
+    }]);
+    setActiveTerminalTab('output');
+    
+    // Set new problem and code in React state (async)
+    setSelectedProblem(newProblem);
+    const initialCode = newProblem.starterCode[language] || '';
+    setMyCode(initialCode);
+    
+    // Reset timer
+    startTimeRef.current = Date.now();
+    
+    // If editor is mounted, update it
+    if (editorRef.current) {
+      editorRef.current.setValue(initialCode);
+    }
+  };
 
   if (isLoading) {
     return (
@@ -1434,9 +1527,10 @@ public class Main {
               
               {/* Terminal Section */}
               <div className="h-[30vh] p-4">
-                <Terminal 
-                  output={terminalOutput} 
-                  testResults={testResults} 
+                <Terminal
+                  key={selectedProblem.id}
+                  output={terminalOutput}
+                  testResults={testResults}
                   activeTab={activeTerminalTab}
                   setActiveTab={setActiveTerminalTab}
                 />
