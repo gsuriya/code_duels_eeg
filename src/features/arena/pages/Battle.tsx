@@ -209,6 +209,9 @@ export default function Battle() {
 
   // Broadcast a new problem ID after a user solves a problem
   const broadcastProblem = useCallback((problemId: string) => {
+    // Ensure gameOver is false when broadcasting a new problem
+    setGameOver(false);
+    
     if (battleChannel && user?.uid) {
       console.log('Broadcasting NEW PROBLEM:', problemId);
       battleChannel.send({
@@ -531,10 +534,112 @@ export default function Battle() {
     );
   };
 
+  // Add a new ref for the run button
+  const runButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Modify the resetProblemState function to log state variables
+  const resetProblemState = (newProblem: Problem, language: SupportedLanguage) => {
+    // Store the new problem in the ref for immediate access
+    currentProblemRef.current = newProblem;
+    
+    // Log state before reset
+    console.log("BUTTON DEBUG - Before Reset:", {
+      isRunning,
+      gameOver,
+      hasWon,
+      hasLost,
+      buttonRef: runButtonRef.current,
+      buttonEnabled: runButtonRef.current ? !runButtonRef.current.disabled : 'unknown',
+      buttonClickable: runButtonRef.current ? runButtonRef.current.style.pointerEvents : 'unknown',
+      overlayPresent: document.querySelector('.absolute.inset-0') !== null
+    });
+    
+    // Reset UI state
+    setTestResults(null);
+    setTerminalOutput([{
+      content: 'Code execution output will appear here...',
+      type: 'default'
+    }]);
+    setActiveTerminalTab('output');
+    
+    // Make sure gameOver is set to false when getting a new problem
+    // This ensures the Run button stays enabled
+    setGameOver(false);
+    
+    // Set new problem and code in React state (async)
+    setSelectedProblem(newProblem);
+    const initialCode = newProblem.starterCode[language] || '';
+    setMyCode(initialCode);
+    
+    // Reset timer
+    startTimeRef.current = Date.now();
+    
+    // If editor is mounted, update it
+    if (editorRef.current) {
+      editorRef.current.setValue(initialCode);
+    }
+
+    // Schedule a log after state updates
+    setTimeout(() => {
+      console.log("BUTTON DEBUG - After Reset:", {
+        newProblemId: newProblem.id,
+        isRunning,
+        gameOver,
+        hasWon,
+        hasLost,
+        buttonRef: runButtonRef.current,
+        buttonEnabled: runButtonRef.current ? !runButtonRef.current.disabled : 'unknown',
+        buttonClickable: runButtonRef.current ? runButtonRef.current.style.pointerEvents : 'unknown',
+        overlayPresent: document.querySelector('.absolute.inset-0') !== null
+      });
+    }, 100);
+  };
+
+  // Add a global hook to the runCode function so it can be triggered by Cmd+Enter even when UI is blocked
+  useEffect(() => {
+    // Create a global access to the runCode function
+    (window as any).triggerRunCode = () => {
+      console.log("MANUAL TRIGGER: Running code via global trigger");
+      // Reset isRunning if it's stuck
+      if (isRunning) {
+        setIsRunning(false);
+      }
+      // Small delay before running code
+      setTimeout(() => runCode(), 50);
+    };
+
+    // Add a global key handler for Cmd+Enter
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        console.log("MANUAL TRIGGER: Cmd+Enter pressed");
+        (window as any).triggerRunCode();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      delete (window as any).triggerRunCode;
+    };
+  }, []);
+
+  // Make the runCode function resilient to blocked UI states
   const runCode = async () => {
+    console.log("BUTTON DEBUG - runCode function called", {
+      time: new Date().toISOString(),
+      gameOver,
+      isRunning
+    });
+    
+    // Force isRunning to false first, to ensure we can start fresh
+    setIsRunning(false);
+    // Small delay to ensure state updates
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    // Continue with normal function
     setIsRunning(true);
     setTerminalOutput([]);
-
+    
     try {
       // Get the latest code directly from the editor
       const latestCode = editorRef.current?.getValue() || myCode;
@@ -1129,13 +1234,24 @@ public class Main {
               
               setTestResults(newTestResults);
               
-              // Check if all test cases passed and declare victory
-              if (passedCount === totalCount && totalCount > 0 && !gameOver) {
+              // Ensure gameOver is DEFINITELY set to false in the code section that handles all test cases passing
+              // This is where we reload a new problem
+              if (passedCount === totalCount && totalCount > 0) {
                 const endTime = Date.now();
                 const currentStartTime = startTimeRef.current;
                 const durationMs = currentStartTime ? endTime - currentStartTime : 0;
                 const formattedDuration = formatDuration(durationMs);
                 const damageDealt = computeDamage(durationMs);
+
+                // Add extra logging to confirm gameOver state before and after damage is dealt
+                console.log("BUTTON DEBUG - All tests passed:", {
+                  gameOverBefore: gameOver,
+                  hasWonBefore: hasWon,
+                  hasLostBefore: hasLost
+                });
+
+                // EXPLICITLY ensure gameOver is false since we're continuing the game
+                setGameOver(false);
 
                 // Broadcast damage to opponent (also updates our opponent health locally in listener)
                 broadcastDamage(damageDealt);
@@ -1143,6 +1259,15 @@ public class Main {
                 // Reset timer and fetch new problem for the solver (random easy)
                 const newProblem = getRandomEasyProblem();
                 resetProblemState(newProblem, currentLanguage);
+
+                // Log game state after problem reset
+                console.log("BUTTON DEBUG - After problem reset:", {
+                  gameOverAfter: gameOver,
+                  hasWonAfter: hasWon,
+                  hasLostAfter: hasLost,
+                  newProblemLoaded: true,
+                  newProblemId: newProblem.id
+                });
 
                 toast({
                   title: 'Problem Solved!',
@@ -1293,32 +1418,23 @@ public class Main {
     // Dependency array only needs things that determine *when* to set the time
   }, [battleState, selectedProblem]); // Removed startTimeRef dependency
 
-  // Add a helper function to properly reset test case state                  
-  const resetProblemState = (newProblem: Problem, language: SupportedLanguage) => {
-    // Store the new problem in the ref for immediate access
-    currentProblemRef.current = newProblem;
-    
-    // Reset UI state
-    setTestResults(null);
-    setTerminalOutput([{
-      content: 'Code execution output will appear here...',
-      type: 'default'
-    }]);
-    setActiveTerminalTab('output');
-    
-    // Set new problem and code in React state (async)
-    setSelectedProblem(newProblem);
-    const initialCode = newProblem.starterCode[language] || '';
-    setMyCode(initialCode);
-    
-    // Reset timer
-    startTimeRef.current = Date.now();
-    
-    // If editor is mounted, update it
-    if (editorRef.current) {
-      editorRef.current.setValue(initialCode);
+  // Add this useEffect to monitor gameOver state
+  useEffect(() => {
+    console.log("BUTTON DEBUG - gameOver state changed:", {
+      gameOver,
+      hasWon,
+      hasLost,
+      playerHealth,
+      opponentHealth,
+      currentProblemId: currentProblemRef.current?.id || selectedProblem?.id
+    });
+
+    // If gameOver is true but health isn't zero, something's wrong - force it back to false
+    if (gameOver && playerHealth > 0 && opponentHealth > 0 && !hasWon && !hasLost) {
+      console.warn("BUTTON DEBUG - Invalid gameOver state detected, forcing to false");
+      setGameOver(false);
     }
-  };
+  }, [gameOver, hasWon, hasLost, playerHealth, opponentHealth, selectedProblem]);
 
   if (isLoading) {
     return (
@@ -1498,8 +1614,11 @@ public class Main {
                 
                 {/* Game Over Overlay */}
                 {gameOver && (
-                  <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex flex-col items-center justify-center z-10">
-                    <div className="text-center p-6 rounded-lg">
+                  <div 
+                    className="absolute inset-0 bg-background/80 backdrop-blur-sm flex flex-col items-center justify-center z-10"
+                    style={{ pointerEvents: 'none' }} // This allows clicks to pass through to elements beneath
+                  >
+                    <div className="text-center p-6 rounded-lg" style={{ pointerEvents: 'auto' }}> {/* Re-enable pointer events only for this div */}
                       {hasWon ? (
                         <>
                           <Crown className="h-16 w-16 text-amber-500 mx-auto mb-4" />
@@ -1541,10 +1660,29 @@ public class Main {
               <div className="w-full">
                 <div className="flex items-center justify-between mb-4">
                   <Button 
-                    onClick={runCode}
-                    disabled={isRunning || gameOver}
-                    className="gap-2" 
+                    ref={runButtonRef}
+                    onClick={(e) => {
+                      console.log("BUTTON DEBUG - Click Attempted:", {
+                        target: e.target,
+                        currentTarget: e.currentTarget,
+                        gameOver,
+                        isRunning,
+                        hasWon,
+                        hasLost,
+                        event: e
+                      });
+                      
+                      // Force button to be clickable programmatically
+                      if (isRunning) {
+                        setIsRunning(false);
+                        setTimeout(() => runCode(), 50);
+                      } else {
+                        runCode();
+                      }
+                    }}
+                    className="gap-2 relative z-50" // Higher z-index to ensure it's above overlays
                     size="sm"
+                    style={{ pointerEvents: 'auto' }} // Ensure pointer events work
                   >
                     {isRunning ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
