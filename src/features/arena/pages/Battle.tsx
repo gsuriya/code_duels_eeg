@@ -8,7 +8,7 @@ import { Badge } from '@ui/data/badge';
 import { Loader2, Users, Crown, Shield, BookOpen, Play, Check, X, ArrowRight } from 'lucide-react';
 import { useToast } from '@shared/hooks/ui/use-toast';
 import { supabase } from '@shared/config/supabase';
-import { Problem, Difficulty, TestCase } from '@/problems/problemTypes';
+import { Problem, TestCase } from '@/problems/problemTypes';
 import { getRandomEasyProblem, submitSolution, getProblemById } from '@/problems/problemService';
 import CodeEditor from '@shared/components/CodeEditor';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@ui/form/select';
@@ -17,6 +17,70 @@ import { debounce } from 'lodash';
 import { Progress } from '@ui/data/progress';
 import Terminal from '@shared/components/Terminal';
 import inspect from 'util';
+
+// Helper function to format duration
+function formatDuration(ms: number): string {
+  if (ms < 0) ms = 0;
+
+  if (ms < 1000) {
+    // Show milliseconds if less than 1 second
+    return `${ms.toFixed(0)} ms`; 
+  }
+
+  const totalSeconds = ms / 1000;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = (totalSeconds % 60);
+
+  const parts: string[] = [];
+
+  if (hours > 0) {
+    parts.push(`${hours} hour${hours !== 1 ? 's' : ''}`);
+  }
+  if (minutes > 0) {
+    parts.push(`${minutes} minute${minutes !== 1 ? 's' : ''}`);
+  }
+  // Only show seconds if > 0 or if it's the only unit left (after hours/minutes)
+  if (seconds > 0 || parts.length === 0) { 
+    // Show one decimal place for seconds only if hours/minutes are not shown
+    const precision = (hours > 0 || minutes > 0) ? 0 : 1; 
+    parts.push(`${seconds.toFixed(precision)} second${seconds !== 1 ? 's' : ''}`);
+  }
+
+  // Handle edge case where calculation results in empty parts (shouldn't happen with ms check)
+  if (parts.length === 0) { 
+      return "0 seconds";
+  }
+
+  return parts.join(', ');
+}
+
+// Simple Health Bar Component
+interface HealthBarProps {
+  playerName: string;
+  currentHealth: number;
+  maxHealth: number;
+  isUser?: boolean; // To potentially style differently later
+}
+
+const HealthBar: React.FC<HealthBarProps> = ({ playerName, currentHealth, maxHealth, isUser }) => {
+  const healthPercentage = maxHealth > 0 ? (currentHealth / maxHealth) * 100 : 0;
+
+  return (
+    <div className={`w-64 p-2 border rounded-lg ${isUser ? 'border-blue-500' : 'border-red-500'} bg-background/80 shadow-sm`}>
+      <div className="flex justify-between items-center mb-1">
+        <span className="text-sm font-medium">{playerName}</span>
+        <span className="text-xs font-mono">{currentHealth} / {maxHealth} HP</span>
+      </div>
+      <div className="w-full bg-muted rounded-full h-2.5 dark:bg-gray-700 overflow-hidden">
+        <div 
+          className={`h-2.5 rounded-full ${isUser ? 'bg-blue-600' : 'bg-red-600'}`} 
+          style={{ width: `${healthPercentage}%` }}
+        ></div>
+      </div>
+    </div>
+  );
+};
 
 // Types for battle state
 interface BattleState {
@@ -89,6 +153,9 @@ export default function Battle() {
   
   // Add state for active terminal tab
   const [activeTerminalTab, setActiveTerminalTab] = useState<'output' | 'testcases'>('output');
+
+  // Use useRef for start time to avoid stale closures in runCode
+  const startTimeRef = useRef<number | null>(null);
 
   // Debounced function to broadcast code updates
   const broadcastCodeUpdate = useCallback(debounce((channel: RealtimeChannel | null, code: string) => {
@@ -351,11 +418,10 @@ export default function Battle() {
     );
   };
 
-  // Function to run the code
   const runCode = async () => {
     setIsRunning(true);
-    setTerminalOutput([]); // Clear previous output
-    
+    setTerminalOutput([]);
+
     try {
       // Get the latest code directly from the editor
       const latestCode = editorRef.current?.getValue() || myCode;
@@ -390,39 +456,62 @@ def execute_user_code():
         # Get the function name from the problem ID using leetcode convention
         function_name_map = {
             'two-sum': 'twoSum',
-            'palindrome-number': 'isPalindrome',
-            'roman-to-integer': 'romanToInt',
-            'valid-parentheses': 'isValid',
-            'merge-two-sorted-lists': 'mergeTwoLists',
+            'best-time-to-buy-and-sell-stock': 'maxProfit',
             'contains-duplicate': 'containsDuplicate',
+            'product-of-array-except-self': 'productExceptSelf',
             'maximum-subarray': 'maxSubArray',
-            'climbing-stairs': 'climbStairs',
-            'best-time-to-buy-and-sell-stock': 'maxProfit'
+            'maximum-product-subarray': 'maxProduct',
+            'find-minimum-in-rotated-sorted-array': 'findMin',
+            'search-in-rotated-sorted-array': 'search',
+            '3sum': 'threeSum',
+            'container-with-most-water': 'maxArea'
+            # Keep existing mappings if needed
+            # 'palindrome-number': 'isPalindrome',
+            # 'roman-to-integer': 'romanToInt',
+            # 'valid-parentheses': 'isValid',
+            # 'merge-two-sorted-lists': 'mergeTwoLists',
+            # 'climbing-stairs': 'climbStairs',
         }
         function_name = function_name_map.get('${currentProblem.id}')
         if not function_name:
-            # Fallback to camelCase if not in map
-            function_name = ''.join(word.capitalize() for word in '${currentProblem.id}'.split('-'))
-            function_name = function_name[0].lower() + function_name[1:]
-        
+            # Fallback should ideally not be needed if map is complete
+            print(chr(10) + "__FIRST_ERROR__")
+            print("Error: Could not determine function name for problem ID: ${currentProblem.id}")
+            error_occurred = True
+            error_message = "Internal error: Function name mapping missing."
+
         # Get the function from the solution class
-        func = getattr(solution, function_name)
-        
+        if not error_occurred:
+            try:
+                func = getattr(solution, function_name)
+            except AttributeError:
+                print(chr(10) + "__FIRST_ERROR__")
+                print(f"Error: Function '{function_name}' not found in Solution class for problem ID '${currentProblem.id}'.")
+                error_occurred = True
+                error_message = f"Function '{function_name}' not implemented."
+
         # Call the function with appropriate arguments
-        if '${currentProblem.id}' == 'two-sum':
-            result = func(sample_input["nums"], sample_input["target"])
-        else:
-            # For all other problems, pass the first key's value from the input
-            first_key = list(sample_input.keys())[0]
-            result = func(sample_input[first_key])
-            
-        print("Function output: " + str(result))
-        
+        if not error_occurred:
+            # Updated argument handling using functionSignature
+            # Inject the parameter names as a Python list
+            param_names = ${JSON.stringify(currentProblem.functionSignature.params.map(p => p.name))}
+            args_to_pass = [sample_input[p_name] for p_name in param_names if p_name in sample_input]
+
+            if len(args_to_pass) == len(param_names):
+                 result = func(*args_to_pass)
+                 print("Function output: " + str(result))
+            else:
+                 print(chr(10) + "__FIRST_ERROR__")
+                 print(f"Error: Mismatch between expected parameters ({param_names}) and provided input keys ({list(sample_input.keys())}) for problem ID '${currentProblem.id}'.")
+                 error_occurred = True
+                 error_message = "Input/parameter mismatch."
+
     except Exception as e:
-        error_occurred = True
-        error_message = "Error executing code: " + str(e)
-        print(chr(10) + "__FIRST_ERROR__")
-        print(error_message)
+        if not error_occurred: # Only capture if not already handled
+            error_occurred = True
+            error_message = "Error executing code: " + str(e)
+            print(chr(10) + "__FIRST_ERROR__")
+            print(error_message)
 
 def run_tests():
     global error_occurred, error_message
@@ -430,8 +519,8 @@ def run_tests():
     try:
         solution = Solution()
         test_cases = ${JSON.stringify(currentProblem.testCases.map(tc => tc.input))}
-        expected_outputs = [${currentProblem.testCases.map(tc => 
-          typeof tc.expectedOutput === 'boolean' 
+        expected_outputs = [${currentProblem.testCases.map(tc =>
+          typeof tc.expectedOutput === 'boolean'
             ? tc.expectedOutput ? 'True' : 'False'
             : JSON.stringify(tc.expectedOutput)
         ).join(',')}]
@@ -439,70 +528,108 @@ def run_tests():
         total = len(test_cases)
         first_test_error_details = None
         test_results_details = []
-        
+
         # Get the function name from the problem ID using leetcode convention
         function_name_map = {
             'two-sum': 'twoSum',
-            'palindrome-number': 'isPalindrome',
-            'roman-to-integer': 'romanToInt',
-            'valid-parentheses': 'isValid',
-            'merge-two-sorted-lists': 'mergeTwoLists',
+            'best-time-to-buy-and-sell-stock': 'maxProfit',
             'contains-duplicate': 'containsDuplicate',
+            'product-of-array-except-self': 'productExceptSelf',
             'maximum-subarray': 'maxSubArray',
-            'climbing-stairs': 'climbStairs',
-            'best-time-to-buy-and-sell-stock': 'maxProfit'
+            'maximum-product-subarray': 'maxProduct',
+            'find-minimum-in-rotated-sorted-array': 'findMin',
+            'search-in-rotated-sorted-array': 'search',
+            '3sum': 'threeSum',
+            'container-with-most-water': 'maxArea'
+             # Keep existing mappings if needed
+            # 'palindrome-number': 'isPalindrome',
+            # 'roman-to-integer': 'romanToInt',
+            # 'valid-parentheses': 'isValid',
+            # 'merge-two-sorted-lists': 'mergeTwoLists',
+            # 'climbing-stairs': 'climbStairs',
         }
         function_name = function_name_map.get('${currentProblem.id}')
         if not function_name:
-            # Fallback to camelCase if not in map
-            function_name = ''.join(word.capitalize() for word in '${currentProblem.id}'.split('-'))
-            function_name = function_name[0].lower() + function_name[1:]
-        
+            # Fallback should ideally not be needed
+            print(chr(10) + "__FIRST_ERROR__")
+            print("Error: Could not determine function name for problem ID: ${currentProblem.id}")
+            error_occurred = True
+            error_message = "Internal error: Function name mapping missing."
+            return # Stop test execution
+
         # Get the function from the solution class
-        func = getattr(solution, function_name)
-        
+        try:
+            func = getattr(solution, function_name)
+        except AttributeError:
+            print(chr(10) + "__FIRST_ERROR__")
+            print(f"Error: Function '{function_name}' not found in Solution class for problem ID '${currentProblem.id}'.")
+            error_occurred = True
+            error_message = f"Function '{function_name}' not implemented."
+            return # Stop test execution
+
+        # Inject the parameter names as a Python list
+        param_names = ${JSON.stringify(currentProblem.functionSignature.params.map(p => p.name))}
+
         for i, (test, expected) in enumerate(zip(test_cases, expected_outputs)):
-            if error_occurred: break
+            if error_occurred: break # Stop if execute_user_code failed earlier
             result_val = None
             error_val = None
             match_status = False
             try:
-                # Call the function with appropriate arguments
-                if '${currentProblem.id}' == 'two-sum':
-                    result_val = func(test["nums"], test["target"])
+                # Call the function with appropriate arguments using functionSignature
+                args_to_pass = [test[p_name] for p_name in param_names if p_name in test]
+
+                if len(args_to_pass) == len(param_names):
+                    result_val = func(*args_to_pass)
                 else:
-                    # For all other problems, pass the first key's value from the input
-                    first_key = list(test.keys())[0]
-                    result_val = func(test[first_key])
-                
-                # Compare results
-                if isinstance(expected, bool):
-                    match_status = result_val == expected
+                    raise ValueError(f"Input/parameter mismatch for test case {i+1}. Expected {param_names}, got {list(test.keys())}")
+
+                # Compare results (improved comparison logic might be needed)
+                # Simple comparison for now
+                if isinstance(expected, list) and isinstance(result_val, list):
+                     # Handle potential list comparison issues (e.g., order for 3sum)
+                     if '${currentProblem.id}' == '3sum':
+                         # Sort both lists of lists before comparing for 3sum
+                         sorted_result = sorted([sorted(triplet) for triplet in result_val])
+                         sorted_expected = sorted([sorted(triplet) for triplet in expected])
+                         match_status = sorted_result == sorted_expected
+                     else:
+                         # Default list comparison (order matters)
+                         match_status = result_val == expected
+                elif isinstance(expected, bool):
+                     match_status = result_val == expected
                 else:
-                    match_status = result_val == expected
-                
+                     match_status = result_val == expected
+
                 if match_status:
                     passed += 1
-                    
+
             except Exception as e:
                 error_val = str(e)
+                # Capture the first error encountered during tests
                 if first_test_error_details is None:
                     first_test_error_details = (i + 1, error_val)
-                    error_occurred = True
-                    error_message = "Error in test case " + str(i + 1) + ": " + error_val
-                    print(chr(10) + "__FIRST_ERROR__")
-                    print(error_message)
-                    return
-            
+                    # Don't set global error_occurred here, let the loop finish
+                    # but record the details for the summary.
+
             test_results_details.append({
                 'test_num': i + 1,
                 'input': test,
                 'expected': expected,
                 'actual': result_val,
-                'error': error_val,
-                'passed': match_status
+                'error': error_val, # Record error per test case
+                'passed': match_status and error_val is None # Must pass AND have no error
             })
-        
+
+        # After loop, if a test error occurred, report the first one
+        if first_test_error_details is not None and not error_occurred:
+             error_occurred = True
+             test_num, error_msg = first_test_error_details
+             error_message = f"Error in test case {test_num}: {error_msg}"
+             print(chr(10) + "__FIRST_ERROR__")
+             print(error_message)
+             # Don't return here, print summary below
+
         if not error_occurred:
             print(chr(10) + "__TEST_DETAILS__")
             for res in test_results_details:
@@ -513,19 +640,24 @@ def run_tests():
                     print("Error: " + str(res['error']))
                 else:
                     print("Output: " + str(res['actual']))
-                print("Status: [" + str('PASS' if res['passed'] else 'FAIL') + "]")
+                # Adjust PASS/FAIL based on error presence
+                status = 'PASS' if res['passed'] else 'FAIL'
+                print("Status: [" + status + "]")
                 print("")
             print(chr(10) + "__TEST_RESULTS_SUMMARY__")
-            print(str(passed) + "/" + str(total))
+            # Ensure passed count matches the details where passed is true and error is null
+            final_passed_count = sum(1 for res in test_results_details if res['passed'])
+            print(str(final_passed_count) + "/" + str(total))
 
     except Exception as e:
+        # Catch errors during the setup of run_tests itself
         if not error_occurred:
             error_occurred = True
             error_message = "Error running tests: " + str(e)
             print(chr(10) + "__FIRST_ERROR__")
             print(error_message)
 
-# --- Execution Order --- # 
+# --- Execution Order --- #
 execute_user_code()
 run_tests()`;
       } else if (currentLanguage === 'javascript') {
@@ -864,13 +996,25 @@ public class Main {
               
               // Check if all test cases passed and declare victory
               if (passedCount === totalCount && totalCount > 0 && !gameOver) {
+                const endTime = Date.now();
+                // Read start time from the ref's current property
+                const currentStartTime = startTimeRef.current;
+                const durationMs = currentStartTime ? (endTime - currentStartTime) : 0;
+                const formattedDuration = formatDuration(durationMs);
+
+                // Log raw timestamps for debugging
+                console.log('🕒 Timer Debug:', { startTime: currentStartTime, endTime, durationMs });
+
                 console.log('🏆 VICTORY CONDITION MET:', {
                   passedCount,
                   totalCount,
                   gameOver,
-                  userId: user?.uid
+                  userId: user?.uid,
+                  durationMs: durationMs,
+                  formattedDuration: formattedDuration
                 });
-                
+                console.log(`Problem solved in ${formattedDuration}.`);
+
                 try {
                   // Update the lobby in the database
                   const { data, error: updateError } = await supabase
@@ -896,7 +1040,7 @@ public class Main {
                   // Show winning toast
                   toast({
                     title: "Victory!",
-                    description: "You've successfully solved all test cases!",
+                    description: `You solved all test cases in ${formattedDuration}!`, // Update toast message
                     variant: "default"
                   });
                 } catch (e) {
@@ -1031,6 +1175,17 @@ public class Main {
     return getProblemById('two-sum');
   };
 
+  // Effect to set start time when battle begins
+  useEffect(() => {
+    // Use the ref here
+    if (battleState && selectedProblem && startTimeRef.current === null) {
+      const now = Date.now();
+      console.log("Setting start time for problem:", selectedProblem.id, "at timestamp:", now);
+      startTimeRef.current = now; // Set the ref's current value
+    }
+    // Dependency array only needs things that determine *when* to set the time
+  }, [battleState, selectedProblem]); // Removed startTimeRef dependency
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -1116,28 +1271,32 @@ public class Main {
         </div>
       </header>
 
+      {/* Health Bars Container */}
+      <div className="container mx-auto px-4 py-2 flex justify-between items-center">
+        <HealthBar playerName="You" currentHealth={100} maxHealth={100} isUser={true} />
+        <HealthBar playerName="Opponent" currentHealth={100} maxHealth={100} isUser={false} />
+      </div>
+
       {/* Main Battle Area - Full Width Code Editor */}
       <main className="flex-grow container mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left Column: Problem Description */}
         <div className="lg:col-span-1 space-y-4">
            <Card className="overflow-hidden sticky top-[60px]"> {/* Adjust top offset based on header height */} 
              <CardHeader className="bg-muted/50 border-b">
-                <CardTitle className="text-xl flex items-center gap-2">
+                <CardTitle className="text-xl flex items-center gap-2 mb-2">
                   <BookOpen className="h-5 w-5 text-primary"/> 
                   {selectedProblem.title}
                 </CardTitle>
-                <div className="mt-1">
-                  <Badge 
-                    variant={
-                      selectedProblem.difficulty === 'easy' ? 'success' : 
-                      selectedProblem.difficulty === 'medium' ? 'warning' : 
-                      'destructive'
-                    }
-                    className="capitalize"
-                  >
-                    {selectedProblem.difficulty}
-                  </Badge>
-                </div>
+                <Badge 
+                  variant={
+                    selectedProblem.difficulty === 'easy' ? 'success' : 
+                    selectedProblem.difficulty === 'medium' ? 'warning' : 
+                    'destructive'
+                  }
+                  className="capitalize w-fit"
+                >
+                  {selectedProblem.difficulty}
+                </Badge>
              </CardHeader>
              <CardContent className="pt-4 max-h-[calc(100vh-150px)] overflow-y-auto"> {/* Adjust max-height */} 
                  {/* Use a markdown renderer here eventually */}

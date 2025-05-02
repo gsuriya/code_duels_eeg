@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@features/auth/AuthContext';
 import { useAdmin } from '@shared/context/AdminContext';
 import { Button } from '@ui/button';
-import { Card } from '@ui/data/card';
+import { Card, CardHeader, CardDescription, CardContent } from '@ui/data/card';
 import { Badge } from '@ui/data/badge';
 import LandingHeader from '@shared/components/LandingHeader';
 import PremiumHeader from '@shared/components/PremiumHeader';
@@ -31,7 +31,6 @@ export default function FindMatch() {
     }
     return false;
   });
-  const [difficulty, setDifficulty] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
   const navigate = useNavigate();
 
@@ -39,23 +38,19 @@ export default function FindMatch() {
     if (searching) {
       const timer = setTimeout(() => {
         setSearching(false);
-        if (difficulty) {
-          navigate(`/battle?difficulty=${difficulty.toLowerCase()}`);
-        }
+        navigate(`/battle`);
       }, 2000);
 
       return () => clearTimeout(timer);
     }
-  }, [searching, navigate, difficulty]);
+  }, [searching, navigate]);
 
   const startSearch = () => {
     if (!isAuthenticated) {
       navigate('/login');
       return;
     }
-    if (difficulty) {
-      setSearching(true);
-    }
+    setSearching(true);
   };
 
   const getTierColor = (tier: string) => {
@@ -100,38 +95,16 @@ export default function FindMatch() {
         
         <div className="max-w-2xl mx-auto">
           <Card className="p-6">
-            <div className="space-y-6">
-              <div>
+            <CardHeader>
+              <CardDescription>
                 <h2 className="text-xl font-semibold mb-4">Select Difficulty</h2>
-                <div className="grid grid-cols-3 gap-4">
-                  <Button
-                    variant={difficulty === 'Easy' ? 'default' : 'outline'}
-                    onClick={() => setDifficulty('Easy')}
-                    className="w-full"
-                  >
-                    Easy
-                  </Button>
-                  <Button
-                    variant={difficulty === 'Medium' ? 'default' : 'outline'}
-                    onClick={() => setDifficulty('Medium')}
-                    className="w-full"
-                  >
-                    Medium
-                  </Button>
-                  <Button
-                    variant={difficulty === 'Hard' ? 'default' : 'outline'}
-                    onClick={() => setDifficulty('Hard')}
-                    className="w-full"
-                  >
-                    Hard
-                  </Button>
-                </div>
-              </div>
-
-              <Button
-                className="w-full bg-gradient-to-r from-primary to-secondary hover:opacity-90"
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col items-center">
+              <Button 
+                className="w-full text-lg py-6 mt-4 bg-green-600 hover:bg-green-700 text-white font-bold"
                 size="lg"
-                disabled={!difficulty || searching}
+                disabled={searching}
                 onClick={startSearch}
               >
                 {searching ? (
@@ -143,7 +116,7 @@ export default function FindMatch() {
                   'Start Matchmaking'
                 )}
               </Button>
-            </div>
+            </CardContent>
           </Card>
         </div>
       </main>

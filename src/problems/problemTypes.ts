@@ -1,5 +1,3 @@
-export type Difficulty = 'easy' | 'medium' | 'hard';
-
 export interface TestCase {
     id: number;
     input: any;
@@ -11,8 +9,8 @@ export interface TestCase {
 export interface Problem {
     id: string;
     title: string;
+    difficulty: 'easy' | 'medium' | 'hard';
     description: string;
-    difficulty: Difficulty;
     starterCode: {
         [key: string]: string;
     };

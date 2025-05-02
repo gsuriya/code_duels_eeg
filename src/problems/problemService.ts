@@ -1,29 +1,30 @@
+/**
+ * src/problems/problemService.ts
+ */
+import { problems } from './index';
 import { Problem } from './problemTypes';
-import { easyProblems } from './easyProblems';
 import { runTests, TestResult } from './testRunner';
 
-export const getRandomEasyProblem = (): Problem => {
-    if (easyProblems.length === 0) {
-        throw new Error('No easy problems available.');
-    }
-    const randomIndex = Math.floor(Math.random() * easyProblems.length);
-    return easyProblems[randomIndex];
+export const getRandomProblem = (): Problem =>
+  problems[Math.floor(Math.random() * problems.length)];
+
+// Add alias for backward compatibility with Battle.tsx
+export const getRandomEasyProblem = getRandomProblem;
+
+export const getProblemById = (id: string): Problem => {
+  const p = problems.find(p => p.id === id);
+  if (!p) throw new Error(`Problem "${id}" not found`);
+  return p;
 };
 
-export const getProblemById = (id: string): Problem | undefined => {
-    return easyProblems.find(p => p.id === id);
-};
-
-export const submitSolution = async (
-    problemId: string,
-    code: string,
-    language: string,
-    terminalOutput: string
+/* optional helper that pipes into your existing Judge0 test runner */
+export const submitSolution = (
+  code: string,
+  language: string,
+  problemId: string
 ): Promise<TestResult[]> => {
-    const problem = getProblemById(problemId);
-    if (!problem) {
-        throw new Error(`Problem with id ${problemId} not found`);
-    }
-
-    return runTests(problem, code, language, terminalOutput);
-}; 
+  const problem = getProblemById(problemId);
+  // Provide an empty string as terminal output or fetch it from somewhere if available
+  const terminalOutput = '';
+  return runTests(problem, code, language, terminalOutput);
+};

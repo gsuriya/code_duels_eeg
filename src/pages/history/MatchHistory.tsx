@@ -176,7 +176,7 @@ export default function MatchHistory() {
                         <TableHead>Score</TableHead>
                         <TableHead>Duration</TableHead>
                         <TableHead>Language</TableHead>
-                        <TableHead>Difficulty</TableHead>
+                        {/* <TableHead>Difficulty</TableHead> */}
                         <TableHead className="text-right">Details</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -193,7 +193,7 @@ export default function MatchHistory() {
                           <TableCell>{match.score}</TableCell>
                           <TableCell>{match.duration}</TableCell>
                           <TableCell>{match.language}</TableCell>
-                          <TableCell>{match.difficulty}</TableCell>
+                          {/* <TableCell>{match.difficulty}</TableCell> */}
                           <TableCell className="text-right">
                             <Dialog>
                               <DialogTrigger asChild>

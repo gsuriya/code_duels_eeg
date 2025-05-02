@@ -1,5 +1,6 @@
 import { supabase } from '@shared/config/supabase';
-import { Problem, Difficulty } from '@/problems/problemTypes';
+// import { Problem, Difficulty } from '@/problems/problemTypes'; // Remove Difficulty
+import { Problem } from '@/problems/problemTypes'; // Keep Problem
 
 export const fetchProblems = async (): Promise<Problem[]> => {
   const { data, error } = await supabase
@@ -22,6 +23,8 @@ export const fetchProblemById = async (id: string): Promise<Problem> => {
   return data;
 };
 
+// Remove the entire fetchProblemsByDifficulty function
+/*
 export const fetchProblemsByDifficulty = async (difficulty: Difficulty): Promise<Problem[]> => {
   const { data, error } = await supabase
     .from('problems')
@@ -32,6 +35,7 @@ export const fetchProblemsByDifficulty = async (difficulty: Difficulty): Promise
   if (error) throw error;
   return data;
 };
+*/
 
 export const createProblem = async (problem: Omit<Problem, 'id'>): Promise<Problem> => {
   const { data, error } = await supabase
