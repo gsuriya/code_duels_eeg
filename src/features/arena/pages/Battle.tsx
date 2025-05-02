@@ -96,6 +96,19 @@ interface BattleState {
 type SupportedLanguage = 'javascript' | 'python' | 'java';
 const supportedLanguages: SupportedLanguage[] = ['javascript', 'python', 'java'];
 
+const MAX_HEALTH = 100; // Maximum health for each player
+
+// Helper to compute damage based on duration (ms)
+function computeDamage(durationMs: number): number {
+  const secs = durationMs / 1000;
+  if (secs <= 120) return 40; // <=2 minutes
+  if (secs <= 180) return 35; // <=3 minutes
+  if (secs <= 300) return 30; // <=5 minutes
+  if (secs <= 480) return 25; // <=8 minutes
+  if (secs <= 600) return 20; // <=10 minutes
+  return 15; // slower than 10 minutes
+}
+
 export default function Battle() {
   const { lobbyCode } = useParams<{ lobbyCode: string }>();
   const navigate = useNavigate();
@@ -171,6 +184,62 @@ export default function Battle() {
       });
     }
   }, 500), [user]);
+
+  const [playerHealth, setPlayerHealth] = useState<number>(MAX_HEALTH);
+  const [opponentHealth, setOpponentHealth] = useState<number>(MAX_HEALTH);
+
+  // Broadcast test results (now includes damage) to opponent
+  const broadcastDamage = useCallback((damage: number) => {
+    if (battleChannel && user?.uid) {
+      console.log('Broadcasting DAMAGE dealt:', damage);
+      battleChannel.send({
+        type: 'broadcast',
+        event: 'test_results',
+        payload: {
+          userId: user.uid,
+          damage,
+          timestamp: Date.now()
+        }
+      });
+    }
+  }, [battleChannel, user]);
+
+  // Listener for damage dealt by opponent
+  useEffect(() => {
+    if (!battleChannel || !user?.uid) return;
+
+    const handleDamage = (payload: any) => {
+      const { userId: senderId, damage } = payload.payload;
+      if (senderId === user.uid) {
+        // This is damage we dealt, so update opponent health on our side
+        setOpponentHealth(prev => {
+          const newVal = Math.max(prev - damage, 0);
+          if (newVal === 0) {
+            setHasWon(true);
+            setGameOver(true);
+            toast({ title: 'Victory!', description: 'Opponent health reached 0', variant: 'default' });
+          }
+          return newVal;
+        });
+        return;
+      }
+
+      console.log('Received DAMAGE from opponent:', damage);
+      setPlayerHealth(prev => {
+        const newHealth = Math.max(prev - damage, 0);
+        if (newHealth === 0) {
+          setHasLost(true);
+          setGameOver(true);
+          toast({ title: 'Defeated', description: 'Your health reached 0!', variant: 'destructive' });
+        }
+        return newHealth;
+      });
+    };
+
+    battleChannel.on('broadcast', { event: 'test_results' }, handleDamage);
+
+    // No reliable off method in current SDK; rely on channel.unsubscribe elsewhere
+  }, [battleChannel, user, toast]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -997,55 +1066,27 @@ public class Main {
               // Check if all test cases passed and declare victory
               if (passedCount === totalCount && totalCount > 0 && !gameOver) {
                 const endTime = Date.now();
-                // Read start time from the ref's current property
                 const currentStartTime = startTimeRef.current;
-                const durationMs = currentStartTime ? (endTime - currentStartTime) : 0;
+                const durationMs = currentStartTime ? endTime - currentStartTime : 0;
                 const formattedDuration = formatDuration(durationMs);
+                const damageDealt = computeDamage(durationMs);
 
-                // Log raw timestamps for debugging
-                console.log('🕒 Timer Debug:', { startTime: currentStartTime, endTime, durationMs });
+                // Broadcast damage to opponent (also updates our opponent health locally in listener)
+                broadcastDamage(damageDealt);
 
-                console.log('🏆 VICTORY CONDITION MET:', {
-                  passedCount,
-                  totalCount,
-                  gameOver,
-                  userId: user?.uid,
-                  durationMs: durationMs,
-                  formattedDuration: formattedDuration
+                // Reset timer and fetch new problem for the solver (random easy)
+                const newProblem = getRandomEasyProblem();
+                setSelectedProblem(newProblem);
+                startTimeRef.current = Date.now();
+                setMyCode(newProblem.starterCode[currentLanguage] || '');
+
+                toast({
+                  title: 'Problem Solved!',
+                  description: `Dealt ${damageDealt} damage in ${formattedDuration}. Next problem loaded!`,
+                  variant: 'default'
                 });
-                console.log(`Problem solved in ${formattedDuration}.`);
 
-                try {
-                  // Update the lobby in the database
-                  const { data, error: updateError } = await supabase
-                    .from('lobbies')
-                    .update({
-                      status: 'completed',
-                      winner_id: user?.uid,
-                      winner_name: user?.displayName || 'Anonymous Player'
-                    })
-                    .eq('code', lobbyCode)
-                    .select();
-                    
-                  if (updateError) {
-                    console.error('Error updating lobby with winner:', updateError);
-                  } else {
-                    console.log('Successfully updated lobby with winner information:', data);
-                  }
-                  
-                  // Set local state immediately
-                  setHasWon(true);
-                  setGameOver(true);
-                  
-                  // Show winning toast
-                  toast({
-                    title: "Victory!",
-                    description: `You solved all test cases in ${formattedDuration}!`, // Update toast message
-                    variant: "default"
-                  });
-                } catch (e) {
-                  console.error('Error updating lobby status:', e);
-                }
+                // No local hasWon/gameOver set here; handled by health logic.
               }
 
             } catch(parsingError) {
@@ -1273,8 +1314,8 @@ public class Main {
 
       {/* Health Bars Container */}
       <div className="container mx-auto px-4 py-2 flex justify-between items-center">
-        <HealthBar playerName="You" currentHealth={100} maxHealth={100} isUser={true} />
-        <HealthBar playerName="Opponent" currentHealth={100} maxHealth={100} isUser={false} />
+        <HealthBar playerName="You" currentHealth={playerHealth} maxHealth={MAX_HEALTH} isUser={true} />
+        <HealthBar playerName="Opponent" currentHealth={opponentHealth} maxHealth={MAX_HEALTH} isUser={false} />
       </div>
 
       {/* Main Battle Area - Full Width Code Editor */}
